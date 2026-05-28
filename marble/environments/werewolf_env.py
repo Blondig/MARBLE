@@ -511,7 +511,8 @@ class WerewolfEnv:
             ]  # Which night (game round + 1)
             self.reset_guard_protection()
             # Add a new dictionary to night_cache to record the current night
-            night_event = {}
+            # night_event = {}
+            night_event = {"player_dead_tonight": []}
             self.shared_memory["private_state"]["night_cache"].append(night_event)
 
             # Guard action
