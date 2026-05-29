@@ -58,7 +58,7 @@ metrics:
   # LLM judge for planning/task scoring; points at the local Qwen3-8B vLLM
   # server (must be UP during the latent run if you want scores).
   evaluate_llm:
-    model: "Qwen3-8B"
+    model: "openai/Qwen3-8B"
 
 engine_planner:
   initial_progress: "Starting the LatentMAS bargaining simulation."

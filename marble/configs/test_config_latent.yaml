@@ -11,7 +11,7 @@ relationships:
   - [agent2, agent3, "collaborates_with"]
 
 # Top-level llm is unused on the latent path (no API calls); kept for schema parity.
-llm: "openai/Qwen/Qwen3-8B"
+llm: "openai/Qwen3-8B"
 
 latent:
   # Local weights, loaded in-process via transformers (white-box, NOT the vLLM server).
@@ -54,7 +54,7 @@ metrics:
   # server, so the vLLM server must be UP during the latent run if you want
   # scores (the judge calls go through litellm -> localhost:9999).
   evaluate_llm:
-    model: "openai/Qwen/Qwen3-8B"
+    model: "openai/Qwen3-8B"
 
 engine_planner:
   initial_progress: "Starting the LatentMAS latent-communication baseline."

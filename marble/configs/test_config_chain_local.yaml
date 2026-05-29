@@ -15,7 +15,7 @@
 coordinate_mode: chain
 
 # Same model as the latent baseline, served locally behind an OpenAI API.
-llm: "openai/Qwen/Qwen3-8B"
+llm: "openai/Qwen3-8B"
 
 relationships:
   - [agent1, agent2, "collaborates_with"]
@@ -47,7 +47,7 @@ memory:
 metrics:
   # Same local Qwen3-8B vLLM server is used both for the agents and the judge.
   evaluate_llm:
-    model: "openai/Qwen/Qwen3-8B"
+    model: "openai/Qwen3-8B"
 
 engine_planner:
   initial_progress: "Starting the text-communication chain baseline."
