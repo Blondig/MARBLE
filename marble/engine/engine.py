@@ -1148,12 +1148,82 @@ class Engine:
             ) if final_output else 0
             self.logger.info(f"Latent coordination final output:\n{final_output}")
 
+            # Evaluation, mirroring chain_coordinate (uses the LLM judge from
+            # config.metrics.evaluate_llm). Wrapped so a judge failure never
+            # loses the computed final output.
+            self._evaluate_latent(summary_data, final_output, agents)
+
         except Exception:
             self.logger.exception("An error occurred during latent coordination.")
             raise
         finally:
+            self.evaluator.finalize()
             self._write_to_jsonl(summary_data)
             self.logger.info("Latent coordination simulation completed.")
+
+    def _evaluate_latent(
+        self, summary_data: Dict[str, Any], final_output: str, agents: List[BaseAgent]
+    ) -> None:
+        """
+        Score a latent run, reusing the same LLM judge as the other modes.
+
+        The MultiAgentBench communication score (arXiv:2503.01935 §3.3) rates the
+        quality of inter-agent *text* messages; latent agents communicate via KV
+        and produce no text, so communication is left unscored and the
+        coordination score is taken as the planning score alone (rather than the
+        usual average of planning and communication). Planning/KPI and the
+        per-environment task evaluation are scored exactly as in chain mode.
+        """
+        try:
+            agent_profiles = self._get_agent_profiles()
+            agent_tasks = self._format_agent_tasks(
+                {agent.agent_id: self.task for agent in agents}
+            )
+            try:
+                self.evaluator.evaluate_planning(
+                    final_output, agent_profiles, agent_tasks, final_output
+                )
+                self.evaluator.evaluate_kpi(self.task, final_output)
+            except Exception:
+                self.logger.exception("Latent planning/KPI evaluation failed.")
+                self.evaluator.metrics["planning_score"].append(-1)
+
+            # Per-environment task score (same dispatch as chain/tree).
+            env_name = self.environment.name
+            if env_name == "Research Environment":
+                self.evaluator.evaluate_task_research(self.task, final_output)
+            elif env_name == "World Simulation Environment":
+                self.evaluator.evaluate_task_world(self.task, final_output)
+            elif env_name == "DB Environment":
+                self.evaluator.evaluate_task_db(
+                    self.task,
+                    final_output,
+                    self.config.task["labels"],
+                    self.config.task["number_of_labels_pred"],
+                    self.config.task["root_causes"],
+                )
+
+            planning_scores = self.evaluator.metrics["planning_score"]
+            valid_planning = [s for s in planning_scores if s is not None and s >= 0]
+            summary_data["planning_scores"] = planning_scores
+            # Communication is not applicable to latent (no text exchanged).
+            summary_data["communication_scores"] = []
+            summary_data["communication_note"] = (
+                "not scored: the communication score rates inter-agent text "
+                "messages, which latent (KV) communication does not produce."
+            )
+            # Coordination = planning only for latent (per design choice).
+            summary_data["coordination_score"] = (
+                sum(valid_planning) / len(valid_planning) if valid_planning else None
+            )
+            summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
+            summary_data["total_milestones"] = self.evaluator.metrics[
+                "total_milestones"
+            ]
+            summary_data["task_evaluation"] = self.evaluator.metrics["task_evaluation"]
+            summary_data["token_usage"] = self._get_totoal_token_usage()
+        except Exception:
+            self.logger.exception("Latent evaluation failed; keeping final output.")
 
     def _build_latent_messages(
         self, agent: BaseAgent, has_context: bool, is_judger: bool

@@ -1,0 +1,67 @@
+# LatentMAS variant of test_config_world (bargaining, World env), chain-ordered.
+# NOTE: the World bargaining task is tool-based ("actively use tools" to offer/
+# counter prices). Latent mode does NOT call environment tools, so the agents
+# only reason in latent space about the scenario and the judger decodes a final
+# negotiation summary. evaluate_task_world still produces buyer/seller scores
+# from that text, but it does not reflect real tool-driven negotiation
+# (that needs the hybrid tool-capable latent path, deferred).
+coordinate_mode: latent
+
+relationships:
+  - [agent1, agent2, "collaborates_with"]
+
+# Unused on the latent path (no API calls for agents); kept for parity.
+llm: "openai/Qwen/Qwen3-8B"
+
+latent:
+  model_name: "/data0/xyao/models/Qwen3-8B"
+  latent_steps: 10
+  latent_space_realign: true
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  device: "cuda"
+
+environment:
+  type: WorldSimulation
+  name: "Bargaining Environment"
+  max_iterations: 3
+
+task:
+  content: |
+    The goal of this simulation is to recreate a realistic bargaining scenario between two agents—a buyer and a seller—around the negotiation for a used 2011 Toyota Corolla.
+    The car's initial asking price is $15,000. The buyer aims to negotiate the price down, leveraging any perceived issues with the car, market pricing comparisons, or potential competing options.
+    Meanwhile, the seller wants to keep the price as close to the original asking price as possible, using arguments related to the car's condition, demand, and any added value.
+    Each agent has limited turns to reach a deal, adding time pressure that could influence concessions.
+
+  output_format: |
+    Provide a clear negotiation summary: the buyer's offers and reasoning, the seller's counters and reasoning, and the final agreed price (or no-deal).
+
+agents:
+  - type: BaseAgent
+    agent_id: agent1
+    profile: |
+      You are a discerning buyer looking to buy a 2011 Toyota Corolla.
+      Your objective is to negotiate the price down, ideally below $15,000,
+      using depreciation factors, repair costs, or competing options.
+  - type: BaseAgent
+    agent_id: agent2
+    profile: |
+      You are a motivated seller of a 2011 Toyota Corolla.
+      Your objective is to keep the price as close as possible to $15,000,
+      emphasizing the car's condition, low mileage, and upgrades.
+
+memory:
+  type: SharedMemory
+
+metrics:
+  # LLM judge for planning/task scoring; points at the local Qwen3-8B vLLM
+  # server (must be UP during the latent run if you want scores).
+  evaluate_llm:
+    model: "openai/Qwen/Qwen3-8B"
+
+engine_planner:
+  initial_progress: "Starting the LatentMAS bargaining simulation."
+
+output:
+  file_path: "result/world_latent_output.jsonl"

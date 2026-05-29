@@ -49,7 +49,12 @@ agents:
 memory:
   type: SharedMemory
 
-metrics: {}
+metrics:
+  # LLM judge for planning/KPI/task scoring. Points at the local Qwen3-8B vLLM
+  # server, so the vLLM server must be UP during the latent run if you want
+  # scores (the judge calls go through litellm -> localhost:9999).
+  evaluate_llm:
+    model: "openai/Qwen/Qwen3-8B"
 
 engine_planner:
   initial_progress: "Starting the LatentMAS latent-communication baseline."
