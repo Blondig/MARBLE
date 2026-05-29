@@ -123,9 +123,21 @@ class ModelWrapper:
     def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=add_generation_prompt
-            )
+            try:
+                # Qwen3 et al. default to a <think> reasoning block, which eats
+                # the decode budget and breaks downstream JSON parsing. The
+                # latent reasoning already happens in KV space, so disable it.
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                # Template does not accept enable_thinking (non-Qwen3 models).
+                return self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=add_generation_prompt
+                )
         segments = []
         for message in messages:
             role = message.get("role", "user")
