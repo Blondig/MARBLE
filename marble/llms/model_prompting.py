@@ -24,7 +24,9 @@ def model_prompting(
     Select model via router in LiteLLM with support for function calling.
     """
     # litellm.set_verbose=True
-    if "together_ai/TA" in llm_model:
+    if llm_model.startswith("openai/Qwen"):
+        base_url = "http://localhost:9999/v1"
+    elif "together_ai/TA" in llm_model:
         base_url = "https://api.ohmygpt.com/v1"
     else:
         base_url = None

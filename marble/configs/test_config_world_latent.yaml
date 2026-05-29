@@ -11,7 +11,7 @@ relationships:
   - [agent1, agent2, "collaborates_with"]
 
 # Unused on the latent path (no API calls for agents); kept for parity.
-llm: "Qwen3-8B"
+llm: "openai/Qwen3-8B"
 
 latent:
   model_name: "/data0/xyao/models/Qwen3-8B"

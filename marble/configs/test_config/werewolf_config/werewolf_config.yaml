@@ -1,5 +1,5 @@
-openai_api_key: "your api key"
-system_prompt_path: marble\\agent\\werewolf_prompts\\system_prompt.yaml
+openai_api_key: "EMPTY"
+system_prompt_path: marble/agent/werewolf_prompts/system_prompt.yaml
 roles:
   - wolf
   - wolf
@@ -13,12 +13,12 @@ roles:
 randomize_roles: True
 use_random_names: True
 villager_config:
-  base_url: "https://api.openai.com/v1"
-  api_key: "your api key"
-  model_name: "gpt-4o"
+  base_url: "http://127.0.0.1:9999/v1"
+  api_key: "EMPTY"
+  model_name: "Qwen3-8B"
 werewolf_config:
-  base_url: "https://api.openai.com/v1"
-  api_key: "your api key"
-  model_name: "gpt-4o"
+  base_url: "http://127.0.0.1:9999/v1"
+  api_key: "EMPTY"
+  model_name: "Qwen3-8B"
 cooperation_mode: "cooperative"
 use_daily_tasks: True
