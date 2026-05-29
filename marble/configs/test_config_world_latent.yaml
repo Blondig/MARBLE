@@ -11,7 +11,7 @@ relationships:
   - [agent1, agent2, "collaborates_with"]
 
 # Unused on the latent path (no API calls for agents); kept for parity.
-llm: "openai/Qwen/Qwen3-8B"
+llm: "Qwen3-8B"
 
 latent:
   model_name: "/data0/xyao/models/Qwen3-8B"
@@ -58,7 +58,7 @@ metrics:
   # LLM judge for planning/task scoring; points at the local Qwen3-8B vLLM
   # server (must be UP during the latent run if you want scores).
   evaluate_llm:
-    model: "openai/Qwen/Qwen3-8B"
+    model: "Qwen3-8B"
 
 engine_planner:
   initial_progress: "Starting the LatentMAS bargaining simulation."
