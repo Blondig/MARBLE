@@ -11,10 +11,11 @@ relationships:
   - [agent2, agent3, "collaborates_with"]
 
 # Top-level llm is unused on the latent path (no API calls); kept for schema parity.
-llm: "Qwen/Qwen2.5-7B-Instruct"
+llm: "openai/Qwen/Qwen3-8B"
 
 latent:
-  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  # Local weights, loaded in-process via transformers (white-box, NOT the vLLM server).
+  model_name: "/data0/xyao/models/Qwen3-8B"
   latent_steps: 10            # continuous thoughts per agent
   latent_space_realign: true  # training-free latent-space alignment (LatentMAS)
   max_new_tokens: 512         # decode budget for the final judger
