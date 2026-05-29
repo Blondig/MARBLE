@@ -1031,6 +1031,169 @@ class Engine:
             self.logger.error(f"Starting agent '{starting_agent_id}' not found.")
             return None
 
+    def latent_coordinate(self) -> None:
+        """
+        LatentMAS-style coordination: agents communicate in latent space.
+
+        Reuses the vendored LatentMAS ``ModelWrapper`` (see
+        ``marble.llms.latent_mas_model``). A single KV cache (the shared latent
+        working memory) is threaded sequentially through the agents in config
+        order: each non-final agent prefills its profile/task prompt on top of
+        the accumulated cache and appends ``latent_steps`` continuous thoughts
+        via :meth:`ModelWrapper.generate_latent_batch`; the final agent acts as
+        the judger and decodes the answer from that cache with
+        :meth:`ModelWrapper.generate_text_batch`. No text is exchanged between
+        agents, and every call runs on the local white-box model.
+        """
+        import torch
+
+        from marble.llms.latent_mas_model import (
+            ModelWrapper,
+            _past_length,
+            truncate_past,
+        )
+
+        cfg = self.config.latent or {}
+        model_name = cfg.get("model_name", "Qwen/Qwen2.5-7B-Instruct")
+        latent_steps = int(cfg.get("latent_steps", 10))
+        max_new_tokens = int(cfg.get("max_new_tokens", 512))
+        temperature = float(cfg.get("temperature", 0.7))
+        top_p = float(cfg.get("top_p", 0.95))
+        latent_space_realign = bool(cfg.get("latent_space_realign", False))
+        # Optional context bounding, mirroring upstream LatentMAS flags.
+        latent_only = bool(cfg.get("latent_only", False))
+        sequential_info_only = bool(cfg.get("sequential_info_only", False)) or latent_only
+        device = torch.device(
+            cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        summary_data: Dict[str, Any] = {
+            "task": self.task,
+            "coordination_mode": self.coordinate_mode,
+            "communication_mode": "latent_mas",
+            "model_name": model_name,
+            "latent_steps": latent_steps,
+            "agents": [],
+            "final_output": "",
+        }
+        try:
+            self.logger.info(
+                f"Loading latent model '{model_name}' on {device} "
+                f"(latent_steps={latent_steps}, realign={latent_space_realign})."
+            )
+            model = ModelWrapper(
+                model_name, device, latent_space_realign=latent_space_realign
+            )
+
+            agents = self.graph.get_all_agents()
+            if not agents:
+                self.logger.error("No agents found for latent coordination.")
+                return
+
+            past_kv: Optional[Any] = None
+            total_latent_steps = 0
+            final_output = ""
+
+            for index, agent in enumerate(agents):
+                is_last = index == len(agents) - 1
+                messages = self._build_latent_messages(
+                    agent, has_context=past_kv is not None, is_judger=is_last
+                )
+                _, input_ids, attention_mask, _ = model.prepare_chat_batch([messages])
+
+                if not is_last:
+                    prev_len = _past_length(past_kv)
+                    past_kv = model.generate_latent_batch(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        latent_steps=latent_steps,
+                        past_key_values=past_kv,
+                    )
+                    if sequential_info_only:
+                        added = _past_length(past_kv) - prev_len
+                        keep = latent_steps if latent_only else added
+                        past_kv = truncate_past(past_kv, keep)
+                    total_latent_steps += latent_steps
+                    summary_data["agents"].append(
+                        {"agent_id": agent.agent_id, "role": "latent", "output": ""}
+                    )
+                    self.logger.info(
+                        f"Agent '{agent.agent_id}' produced {latent_steps} latent thoughts."
+                    )
+                else:
+                    generations, _ = model.generate_text_batch(
+                        input_ids,
+                        attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        past_key_values=past_kv if latent_steps > 0 else None,
+                    )
+                    final_output = generations[0].strip()
+                    summary_data["agents"].append(
+                        {
+                            "agent_id": agent.agent_id,
+                            "role": "judger",
+                            "output": final_output,
+                        }
+                    )
+                    self.logger.info(
+                        f"Judger '{agent.agent_id}' decoded final answer."
+                    )
+
+            summary_data["final_output"] = final_output
+            summary_data["total_latent_steps"] = total_latent_steps
+            summary_data["decoded_tokens"] = int(
+                model.tokenize_text(final_output).shape[-1]
+            ) if final_output else 0
+            self.logger.info(f"Latent coordination final output:\n{final_output}")
+
+        except Exception:
+            self.logger.exception("An error occurred during latent coordination.")
+            raise
+        finally:
+            self._write_to_jsonl(summary_data)
+            self.logger.info("Latent coordination simulation completed.")
+
+    def _build_latent_messages(
+        self, agent: BaseAgent, has_context: bool, is_judger: bool
+    ) -> List[Dict[str, str]]:
+        """Build the chat messages for one agent in the latent chain."""
+        profile = agent.get_profile()
+        if is_judger:
+            context_note = (
+                "You are given the previous agents' latent working memory for "
+                "reference; it may contain irrelevant content, so use it only if "
+                "helpful.\n"
+                if has_context
+                else ""
+            )
+            user = (
+                f"You are {agent.agent_id}: {profile}\n"
+                f"Task: {self.task}\n"
+                f"{context_note}"
+                "Now solve the task and produce the final answer.\n"
+                f"Output format: {self.output_format}"
+            )
+        else:
+            context_note = (
+                "The previous agents' latent working memory is already attended "
+                "to in your context; build on it.\n"
+                if has_context
+                else ""
+            )
+            user = (
+                f"You are {agent.agent_id}: {profile}\n"
+                f"Task: {self.task}\n"
+                f"{context_note}"
+                "Contribute your reasoning toward solving the task. "
+                "Do not produce the final answer."
+            )
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": user},
+        ]
+
     def start(self) -> None:
         """
         Start the engine to run the simulation.
@@ -1041,6 +1204,9 @@ class Engine:
         if self.coordinate_mode == "star":
             self.logger.info("Running in centralized coordination mode.")
             self.star_coordinate()
+        elif self.coordinate_mode == "latent":
+            self.logger.info("Running in latent (LatentMAS) coordination mode.")
+            self.latent_coordinate()
         elif self.coordinate_mode == "graph":
             self.logger.info("Running in graph-based coordination mode.")
             self.graph_coordinate()

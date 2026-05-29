@@ -34,6 +34,8 @@ class Config:
         self.coordination_mode = data.get("coordinate_mode", "centralized")
         self.relationships = data.get("relationships", [])
         self.output = data.get("output", {})
+        # LatentMAS baseline settings, used only when coordinate_mode == "latent".
+        self.latent = data.get("latent", {})
 
     @staticmethod
     def load(file_path: str) -> "Config":

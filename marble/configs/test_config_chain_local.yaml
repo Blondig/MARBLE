@@ -1,0 +1,55 @@
+# Text-communication counterpart of test_config_latent.yaml, for a fair A/B.
+# Same task, same 3 agents/profiles, same chain ordering -- the ONLY difference
+# from the latent version is the communication channel (plaintext vs latent KV)
+# and that this path runs the model via an OpenAI-compatible API.
+#
+# To make it a controlled comparison, point MARBLE at the SAME local Qwen-7B:
+#   pip install vllm
+#   python -m vllm.entrypoints.openai.api_server \
+#       --model Qwen/Qwen2.5-7B-Instruct --port 8000
+#   export OPENAI_API_BASE=http://localhost:8000/v1
+#   export OPENAI_API_KEY=dummy
+#   python -m marble.main --config_path marble/configs/test_config_chain_local.yaml
+#
+# NOTE: chain mode currently crashes on a pre-existing bug
+# (engine.py calls graph.get_agent_profiles_linked, which does not exist).
+# It must be fixed (one line) before this config can run.
+coordinate_mode: chain
+
+# Same model as the latent baseline, served locally behind an OpenAI API.
+llm: "openai/Qwen/Qwen2.5-7B-Instruct"
+
+relationships:
+  - [agent1, agent2, "collaborates_with"]
+  - [agent2, agent3, "collaborates_with"]
+
+environment:
+  type: Base
+  name: "Latent Base Environment"
+  max_iterations: 1
+
+task:
+  content: "Explain why the sky appears blue, then give a one-sentence summary."
+  output_format: "Provide a clear final answer."
+
+agents:
+  - type: BaseAgent
+    agent_id: agent1
+    profile: "A planner that lays out a concise step-by-step approach to the task."
+  - type: BaseAgent
+    agent_id: agent2
+    profile: "A critic that reviews the plan and points out gaps or errors."
+  - type: BaseAgent
+    agent_id: agent3
+    profile: "A solver that produces the final answer using all prior reasoning."
+
+memory:
+  type: SharedMemory
+
+metrics: {}
+
+engine_planner:
+  initial_progress: "Starting the text-communication chain baseline."
+
+output:
+  file_path: "result/chain_local_output.jsonl"

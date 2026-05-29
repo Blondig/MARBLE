@@ -43,6 +43,16 @@ types-setuptools = "*"
 pytest = "*"
 pytest-asyncio = "*"
 
+# Optional: LatentMAS latent-communication baseline (coordinate_mode: latent).
+# Install with `poetry install --with latent`. Requires a local GPU.
+[tool.poetry.group.latent]
+optional = true
+
+[tool.poetry.group.latent.dependencies]
+torch = "*"
+transformers = "*"
+accelerate = "*"
+
 
 [build-system]
 requires = ["poetry-core"]

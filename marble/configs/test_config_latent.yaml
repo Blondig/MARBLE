@@ -1,0 +1,57 @@
+# LatentMAS communication baseline.
+# Agents collaborate by threading a shared KV-cache (latent working memory)
+# instead of exchanging text. Requires a local white-box model + GPU and the
+# optional `latent` dependency group: `poetry install --with latent`.
+coordinate_mode: latent
+
+# Chain order = agent order below. The last agent is the judger that decodes
+# the final text answer from the accumulated latent working memory.
+relationships:
+  - [agent1, agent2, "collaborates_with"]
+  - [agent2, agent3, "collaborates_with"]
+
+# Top-level llm is unused on the latent path (no API calls); kept for schema parity.
+llm: "Qwen/Qwen2.5-7B-Instruct"
+
+latent:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  latent_steps: 10            # continuous thoughts per agent
+  latent_space_realign: true  # training-free latent-space alignment (LatentMAS)
+  max_new_tokens: 512         # decode budget for the final judger
+  temperature: 0.7
+  top_p: 0.95
+  device: "cuda"              # set to "cpu" only for tiny smoke tests
+  # Context bounding (optional, mirrors upstream LatentMAS flags):
+  # sequential_info_only: false  # keep only each agent's freshly added KV
+  # latent_only: false           # keep only the latent_steps positions per hop
+
+environment:
+  type: Base
+  name: "Latent Base Environment"
+  max_iterations: 1
+
+task:
+  content: "Explain why the sky appears blue, then give a one-sentence summary."
+  output_format: "Provide a clear final answer."
+
+agents:
+  - type: BaseAgent
+    agent_id: agent1
+    profile: "A planner that lays out a concise step-by-step approach to the task."
+  - type: BaseAgent
+    agent_id: agent2
+    profile: "A critic that reviews the plan and points out gaps or errors."
+  - type: BaseAgent
+    agent_id: agent3
+    profile: "A solver that produces the final answer using all prior reasoning."
+
+memory:
+  type: SharedMemory
+
+metrics: {}
+
+engine_planner:
+  initial_progress: "Starting the LatentMAS latent-communication baseline."
+
+output:
+  file_path: "result/latent_output.jsonl"

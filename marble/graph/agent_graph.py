@@ -294,6 +294,39 @@ class AgentGraph:
             }
         return profiles
 
+    def get_agent_profiles_linked(self, agent_id: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Get profiles of agents directly linked to the given agent.
+
+        An agent is "linked" if it shares a relationship edge with ``agent_id``
+        (as either the source or the target). Used by chain coordination so an
+        agent picks its next hop among its relationship neighbors only.
+
+        Args:
+            agent_id (str): The ID of the agent whose neighbors to retrieve.
+
+        Returns:
+            Dict[str, Dict[str, Any]]: Mapping of linked agent IDs to profiles,
+            in the same shape as :meth:`get_agent_profiles`.
+        """
+        linked_ids = set()
+        for source, target, _ in self.relationships:
+            if source == agent_id:
+                linked_ids.add(target)
+            elif target == agent_id:
+                linked_ids.add(source)
+        profiles: Dict[str, Dict[str, Any]] = {}
+        for linked_id in linked_ids:
+            agent = self.agents.get(linked_id)
+            if agent is None:
+                continue
+            profiles[linked_id] = {
+                "agent_id": agent.agent_id,
+                "relationships": agent.relationships,
+                "profile": agent.get_profile(),
+            }
+        return profiles
+
     def get_roots(self) -> List[BaseAgent]:
         """
         Get the root agents (agents with no parents).
