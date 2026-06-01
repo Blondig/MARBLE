@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Define the directory containing the YAML configuration files
-CONFIG_DIR="/Users/guoshuyi/Desktop/marble2/MARBLE/data/bargaining-data/yaml-seller-Llama-3.1-70B-Instruct-Turbo"
+CONFIG_DIR="./marble/configs/test_config_world"
 
 # Check if the directory exists
 if [ ! -d "$CONFIG_DIR" ]; then
