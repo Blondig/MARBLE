@@ -24,8 +24,12 @@ def model_prompting(
     Select model via router in LiteLLM with support for function calling.
     """
     # litellm.set_verbose=True
+    extra_body = None
     if llm_model.startswith("openai/Qwen"):
         base_url = "http://localhost:9999/v1"
+        # Disable Qwen3 <think> so vLLM returns clean content (JSON for the
+        # planner/judge); thinking left empty content and broke json parsing.
+        extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
     elif "together_ai/TA" in llm_model:
         base_url = "https://api.ohmygpt.com/v1"
     else:
@@ -41,6 +45,7 @@ def model_prompting(
         tools=tools,
         tool_choice=tool_choice,
         base_url=base_url,
+        extra_body=extra_body,
     )
     message_0: Message = completion.choices[0].message
     assert message_0 is not None
