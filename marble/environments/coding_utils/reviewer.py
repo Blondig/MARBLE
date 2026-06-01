@@ -5,9 +5,25 @@ import re
 from typing import Any, Dict
 
 from litellm.utils import token_counter
-from ruamel.yaml import YAML
 
 from marble.llms.model_prompting import model_prompting
+
+
+def _get_task_content(env, task_description: str) -> str:
+    task_content = getattr(env, "task_description", "") or task_description
+    if not task_content:
+        raise ValueError("Task description is required.")
+    return task_content
+
+
+def _extract_requirements(task_description: str) -> str:
+    requirements_start = "1. Implementation requirements:\n"
+    requirements_end = "\n\n2. Project structure:"
+    start_index = task_description.find(requirements_start)
+    end_index = task_description.find(requirements_end)
+    if start_index == -1 or end_index == -1 or end_index <= start_index:
+        return ""
+    return task_description[start_index + len(requirements_start) : end_index].strip()
 
 
 def log_debug_info(message: str, log_file: str = "marble/logs/advice_log"):
@@ -57,25 +73,8 @@ def give_advice_and_revise_handler(
                 "error-msg": "Solution file is empty or contains invalid code. Please use create_solution first to generate valid code",
             }
 
-        config_path = "marble/configs/coding_config/coding_config.yaml"
-        if not os.path.exists(config_path):
-            return {
-                "success": False,
-                "error-msg": f"Config file not found at {config_path}",
-            }
-
-        yaml = YAML()
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.load(f)
-
-        full_task_description = config["task"]["content"]
-
-        requirements_start = "1. Implementation requirements:\n"
-        requirements_end = "\n\n2. Project structure:"
-        requirements = full_task_description[
-            full_task_description.find(requirements_start)
-            + len(requirements_start) : full_task_description.find(requirements_end)
-        ].strip()
+        full_task_description = _get_task_content(env, task_description)
+        requirements = _extract_requirements(full_task_description)
 
         # Step 1: Generate single most important suggestion
         system_prompt_advice = (
@@ -277,7 +276,7 @@ def register_reviewer_actions(env):
                     "properties": {
                         "task_description": {
                             "type": "string",
-                            "description": "Description of the task (will be read from config file)",
+                            "description": "Description of the task",
                         },
                         "model_name": {
                             "type": "string",

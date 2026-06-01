@@ -81,6 +81,9 @@ class Engine:
         # Initialize Evaluator
         self.evaluator = Evaluator(metrics_config=config.metrics)
         self.task = config.task.get("content", "")
+        if isinstance(self.environment, CodingEnvironment):
+            self.environment.task_description = self.task
+            self.environment.state["task_description"] = self.task
         self.output_format = config.task.get(
             "output_format",
             "You are free to define your own output format to answer the task properly.",
