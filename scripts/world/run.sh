@@ -13,7 +13,7 @@ fi
 for CONFIG_FILE in "$CONFIG_DIR"/*.yaml; do
     if [ -f "$CONFIG_FILE" ]; then
         echo "Running configuration: $CONFIG_FILE"
-        python main.py --config_path "$CONFIG_FILE"
+        python marble/main.py --config_path "$CONFIG_FILE"
 
         # Check if the execution was successful
         if [ $? -ne 0 ]; then
