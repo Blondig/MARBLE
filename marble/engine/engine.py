@@ -1174,7 +1174,11 @@ class Engine:
         - Coordination = planning only for latent (communication is N/A).
         - All judge calls are isolated so a failure never drops the final output.
         """
-        # Planning + KPI via the original LLM judge (same as chain_coordinate).
+        # Planning via the original LLM judge (holistic rating from the final
+        # output + profiles). KPI is intentionally NOT scored for latent: the
+        # milestone-based KPI needs each agent's text contribution to attribute
+        # milestones, but latent agents (except the final one) emit only KV, so
+        # the judge would have to fabricate per-agent attribution.
         try:
             agent_profiles = self._get_agent_profiles()
             agent_tasks = self._format_agent_tasks(
@@ -1183,9 +1187,8 @@ class Engine:
             self.evaluator.evaluate_planning(
                 final_output, agent_profiles, agent_tasks, final_output
             )
-            self.evaluator.evaluate_kpi(self.task, final_output)
         except Exception:
-            self.logger.exception("Latent planning/KPI evaluation failed.")
+            self.logger.exception("Latent planning evaluation failed.")
             self.evaluator.metrics["planning_score"].append(-1)
 
         planning_scores = self.evaluator.metrics["planning_score"]
@@ -1221,8 +1224,13 @@ class Engine:
         except Exception:
             self.logger.exception("Latent task evaluation failed; leaving it empty.")
 
-        summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
-        summary_data["total_milestones"] = self.evaluator.metrics["total_milestones"]
+        # KPI/milestone attribution is not measurable for latent (see above).
+        summary_data["agent_kpis"] = {}
+        summary_data["total_milestones"] = None
+        summary_data["kpi_note"] = (
+            "not scored: milestone KPI / per-agent attribution needs each agent's "
+            "text output; latent agents (except the final one) produce only KV."
+        )
         summary_data["task_evaluation"] = self.evaluator.metrics["task_evaluation"]
 
     def _build_latent_messages(

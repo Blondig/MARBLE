@@ -46,6 +46,18 @@ def main() -> None:
         logging.error(f"Error loading configuration from {args.config_path}: {e}")
         sys.exit(1)
 
+    # Hard override: route every agent + judge LLM call to the local Qwen3-8B
+    # vLLM server, regardless of what the config files specify. The "openai/"
+    # prefix is what model_prompting routes to http://localhost:9999/v1.
+    # (Latent agents ignore this and use config.latent.model_name instead.)
+    LOCAL_MODEL = "openai/Qwen3-8B"
+    config.llm = LOCAL_MODEL
+    for agent_cfg in config.agents:
+        if isinstance(agent_cfg, dict):
+            agent_cfg["llm"] = LOCAL_MODEL
+    if isinstance(config.metrics, dict):
+        config.metrics["evaluate_llm"] = {"model": LOCAL_MODEL}
+
     # Initialize and start the engine
     try:
         logging.info(f"Starting engine with configuration: {args.config_path}")
