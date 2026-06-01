@@ -1,0 +1,49 @@
+# Fixed-pipeline TEXT baseline — the apples-to-apples counterpart of
+# test_config_latent.yaml. Same task, same 3 agents, same order. The ONLY
+# difference vs the latent config is the communication channel: here agents
+# pass plaintext to each other (scored by communication_score); in the latent
+# config they pass KV (communication N/A). No dynamic early-stop (unlike chain).
+#
+# Run against the same local Qwen3-8B vLLM server:
+#   export OPENAI_API_BASE=http://localhost:9999/v1 OPENAI_API_KEY=EMPTY
+#   python -m marble.main --config_path marble/configs/test_config_fixed_chain.yaml
+coordinate_mode: fixed_chain
+
+llm: "openai/Qwen3-8B"
+
+relationships:
+  - [agent1, agent2, "collaborates_with"]
+  - [agent2, agent3, "collaborates_with"]
+
+environment:
+  type: Base
+  name: "Latent Base Environment"
+  max_iterations: 1
+
+task:
+  content: "Explain why the sky appears blue, then give a one-sentence summary."
+  output_format: "Provide a clear final answer."
+
+agents:
+  - type: BaseAgent
+    agent_id: agent1
+    profile: "A planner that lays out a concise step-by-step approach to the task."
+  - type: BaseAgent
+    agent_id: agent2
+    profile: "A critic that reviews the plan and points out gaps or errors."
+  - type: BaseAgent
+    agent_id: agent3
+    profile: "A solver that produces the final answer using all prior reasoning."
+
+memory:
+  type: SharedMemory
+
+metrics:
+  evaluate_llm:
+    model: "openai/Qwen3-8B"
+
+engine_planner:
+  initial_progress: "Starting the fixed-chain text baseline."
+
+output:
+  file_path: "result/fixed_chain_output.jsonl"

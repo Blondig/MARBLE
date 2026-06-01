@@ -1148,10 +1148,9 @@ class Engine:
             ) if final_output else 0
             self.logger.info(f"Latent coordination final output:\n{final_output}")
 
-            # Record scores the same way graph coordination does (see
-            # _evaluate_latent); per-environment task scoring reuses the
-            # original evaluator.
-            self._evaluate_latent(summary_data, final_output)
+            # Score planning/KPI/task with the original evaluator (see
+            # _evaluate_latent); communication stays N/A for latent.
+            self._evaluate_latent(summary_data, final_output, agents)
 
         except Exception:
             self.logger.exception("An error occurred during latent coordination.")
@@ -1161,21 +1160,34 @@ class Engine:
             self._write_to_jsonl(summary_data)
             self.logger.info("Latent coordination simulation completed.")
 
-    def _evaluate_latent(self, summary_data: Dict[str, Any], final_output: str) -> None:
+    def _evaluate_latent(
+        self, summary_data: Dict[str, Any], final_output: str, agents: List[BaseAgent]
+    ) -> None:
         """
-        Record scores for a latent run, mirroring the original code.
+        Score a latent run, reusing the original evaluator like chain/tree do.
 
+        - Planning + KPI: scored with the original LLM-judge methods, so latent
+          is comparable to the text baseline on these metrics.
         - Communication: not applicable -- the MultiAgentBench communication
           score (arXiv:2503.01935 §3.3) rates inter-agent *text* messages, which
           latent (KV) communication does not produce. Left unscored.
-        - Planning: recorded as -1, exactly like graph_coordinate (the original
-          evaluate_planning is intentionally not invoked).
-        - Coordination = planning only for latent (so it stays None here).
-        - Per-environment task_evaluation reuses the original evaluator methods,
-          isolated so a judge/template failure can never drop the final output.
+        - Coordination = planning only for latent (communication is N/A).
+        - All judge calls are isolated so a failure never drops the final output.
         """
-        # Mirror graph_coordinate: planning is not scored, recorded as -1.
-        self.evaluator.metrics["planning_score"].append(-1)
+        # Planning + KPI via the original LLM judge (same as chain_coordinate).
+        try:
+            agent_profiles = self._get_agent_profiles()
+            agent_tasks = self._format_agent_tasks(
+                {agent.agent_id: self.task for agent in agents}
+            )
+            self.evaluator.evaluate_planning(
+                final_output, agent_profiles, agent_tasks, final_output
+            )
+            self.evaluator.evaluate_kpi(self.task, final_output)
+        except Exception:
+            self.logger.exception("Latent planning/KPI evaluation failed.")
+            self.evaluator.metrics["planning_score"].append(-1)
+
         planning_scores = self.evaluator.metrics["planning_score"]
         valid_planning = [s for s in planning_scores if s is not None and s >= 0]
 
@@ -1252,6 +1264,164 @@ class Engine:
             {"role": "user", "content": user},
         ]
 
+    def fixed_chain_coordinate(self) -> None:
+        """
+        Fixed-pipeline TEXT baseline, structurally mirroring latent_coordinate.
+
+        Every agent runs once in config order (no dynamic routing or early stop,
+        unlike chain_coordinate); each agent's TEXT output is passed to the next
+        as context -- this is the text communication channel. The last agent
+        produces the final answer. This is the apples-to-apples text counterpart
+        of the latent baseline: same agents, same order, only the communication
+        channel differs (plaintext vs latent KV).
+        """
+        from litellm.utils import token_counter
+
+        from marble.llms.model_prompting import model_prompting
+
+        summary_data: Dict[str, Any] = {
+            "task": self.task,
+            "coordination_mode": self.coordinate_mode,
+            "communication_mode": "text",
+            "agents": [],
+            "final_output": "",
+        }
+        try:
+            agents = self.graph.get_all_agents()
+            if not agents:
+                self.logger.error("No agents found for fixed-chain coordination.")
+                return
+
+            context = ""
+            handoffs: List[str] = []
+            final_output = ""
+            for index, agent in enumerate(agents):
+                is_last = index == len(agents) - 1
+                messages = self._build_chain_text_messages(agent, context, is_last)
+                result = model_prompting(
+                    llm_model=agent.llm,
+                    messages=messages,
+                    return_num=1,
+                    max_token_num=512,
+                    temperature=0.0,
+                    top_p=None,
+                    stream=None,
+                )[0]
+                text = result.content or ""
+                agent.token_usage += token_counter(
+                    model=agent.llm,
+                    messages=messages + [{"role": "assistant", "content": text}],
+                )
+                summary_data["agents"].append(
+                    {
+                        "agent_id": agent.agent_id,
+                        "role": "judger" if is_last else "agent",
+                        "output": text,
+                    }
+                )
+                if is_last:
+                    final_output = text
+                else:
+                    handoff = f"From {agent.agent_id}: {text}"
+                    context += handoff + "\n"
+                    handoffs.append(handoff)
+                self.logger.info(
+                    f"Agent '{agent.agent_id}' produced output (is_last={is_last})."
+                )
+            summary_data["final_output"] = final_output
+
+            # Scoring with the original evaluator: communication on the text
+            # handoffs (this is what latent has N/A), plus planning/KPI/task.
+            communications_str = "\n".join(handoffs)
+            if communications_str.strip():
+                self.evaluator.evaluate_communication(self.task, communications_str)
+            else:
+                self.evaluator.metrics["communication_score"].append(-1)
+            try:
+                agent_profiles = self._get_agent_profiles()
+                agent_tasks = self._format_agent_tasks(
+                    {agent.agent_id: self.task for agent in agents}
+                )
+                self.evaluator.evaluate_planning(
+                    final_output, agent_profiles, agent_tasks, final_output
+                )
+                self.evaluator.evaluate_kpi(self.task, final_output)
+            except Exception:
+                self.logger.exception("Fixed-chain planning/KPI evaluation failed.")
+                self.evaluator.metrics["planning_score"].append(-1)
+            try:
+                env_name = self.environment.name
+                if env_name == "Research Environment":
+                    self.evaluator.evaluate_task_research(self.task, final_output)
+                elif env_name == "World Simulation Environment":
+                    self.evaluator.evaluate_task_world(self.task, final_output)
+                elif env_name == "DB Environment":
+                    self.evaluator.evaluate_task_db(
+                        self.task,
+                        final_output,
+                        self.config.task["labels"],
+                        self.config.task["number_of_labels_pred"],
+                        self.config.task["root_causes"],
+                    )
+            except Exception:
+                self.logger.exception(
+                    "Fixed-chain task evaluation failed; leaving it empty."
+                )
+
+            planning = self.evaluator.metrics["planning_score"]
+            comm = self.evaluator.metrics["communication_score"]
+            valid_p = [s for s in planning if s is not None and s >= 0]
+            valid_c = [s for s in comm if s is not None and s >= 0]
+            summary_data["planning_scores"] = planning
+            summary_data["communication_scores"] = comm
+            # Coordination = (planning + communication)/2 (paper formula; the
+            # text baseline has both sub-scores, unlike latent which is planning-only).
+            p_avg = sum(valid_p) / len(valid_p) if valid_p else None
+            c_avg = sum(valid_c) / len(valid_c) if valid_c else None
+            if p_avg is not None and c_avg is not None:
+                summary_data["coordination_score"] = (p_avg + c_avg) / 2
+            else:
+                summary_data["coordination_score"] = p_avg if c_avg is None else c_avg
+            summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
+            summary_data["total_milestones"] = self.evaluator.metrics["total_milestones"]
+            summary_data["task_evaluation"] = self.evaluator.metrics["task_evaluation"]
+            summary_data["token_usage"] = self._get_totoal_token_usage()
+            self.logger.info(f"Fixed-chain final output:\n{final_output}")
+        except Exception:
+            self.logger.exception("An error occurred during fixed-chain coordination.")
+            raise
+        finally:
+            self.evaluator.finalize()
+            self._write_to_jsonl(summary_data)
+            self.logger.info("Fixed-chain coordination simulation completed.")
+
+    def _build_chain_text_messages(
+        self, agent: BaseAgent, context: str, is_judger: bool
+    ) -> List[Dict[str, str]]:
+        """Messages for one agent in the fixed TEXT chain (text communication)."""
+        profile = agent.get_profile()
+        ctx = f"Previous agents' outputs:\n{context}\n" if context.strip() else ""
+        if is_judger:
+            user = (
+                f"You are {agent.agent_id}: {profile}\n"
+                f"Task: {self.task}\n"
+                f"{ctx}"
+                "Now solve the task and produce the final answer.\n"
+                f"Output format: {self.output_format}"
+            )
+        else:
+            user = (
+                f"You are {agent.agent_id}: {profile}\n"
+                f"Task: {self.task}\n"
+                f"{ctx}"
+                "Contribute your reasoning toward solving the task. "
+                "Do not produce the final answer."
+            )
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": user},
+        ]
+
     def start(self) -> None:
         """
         Start the engine to run the simulation.
@@ -1265,6 +1435,9 @@ class Engine:
         elif self.coordinate_mode == "latent":
             self.logger.info("Running in latent (LatentMAS) coordination mode.")
             self.latent_coordinate()
+        elif self.coordinate_mode == "fixed_chain":
+            self.logger.info("Running in fixed-chain (text baseline) coordination mode.")
+            self.fixed_chain_coordinate()
         elif self.coordinate_mode == "graph":
             self.logger.info("Running in graph-based coordination mode.")
             self.graph_coordinate()
