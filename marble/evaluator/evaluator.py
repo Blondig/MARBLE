@@ -77,8 +77,12 @@ class Evaluator:
         """
         # Get the communication prompt
         communication_prompt_template = self.evaluation_prompts["Graph"]["Communication"]["prompt"]
-        # Fill in the placeholders {task} and {communications}
-        prompt = communication_prompt_template.format(task=task, communications=communications)
+        # Fill in the placeholders {task} and {communications} via targeted
+        # replacement (not str.format): the prompt also contains a literal JSON
+        # example {"rating": X} that would otherwise break .format().
+        prompt = communication_prompt_template.replace("{task}", task).replace(
+            "{communications}", communications
+        )
         # Call the language model
         result = model_prompting(
             llm_model=self.llm,
@@ -107,13 +111,15 @@ class Evaluator:
         """
         # Get the planning prompt
         planning_prompt_template = self.evaluation_prompts["Graph"]["Planning"]["prompt"]
-        # Fill in the placeholders
-        prompt = planning_prompt_template.format(
-            summary=summary,
-            agent_profiles=agent_profiles,
-            agent_tasks=agent_tasks,
-            results=results
-        )
+        # Fill in the placeholders via targeted replacement (not str.format):
+        # the prompt also contains a literal JSON example {"rating": X} that
+        # would otherwise break .format(). All four placeholders are replaced,
+        # same as the original .format(summary, agent_profiles, agent_tasks, results).
+        prompt = planning_prompt_template
+        prompt = prompt.replace("{summary}", summary)
+        prompt = prompt.replace("{agent_profiles}", agent_profiles)
+        prompt = prompt.replace("{agent_tasks}", agent_tasks)
+        prompt = prompt.replace("{results}", results)
         # Call the language model
         result = model_prompting(
             llm_model=self.llm,
@@ -144,8 +150,12 @@ class Evaluator:
         if len(agent_results) > MAX_LENGTH:
             agent_results = agent_results[:MAX_LENGTH] + "..."
         kpi_prompt_template = self.evaluation_prompts["Graph"]["KPI"]["prompt"]
-        # Fill in the placeholders {task} and {agent_results}
-        prompt = kpi_prompt_template.format(task=task, agent_results=agent_results)
+        # Fill in the placeholders via targeted replacement (not str.format):
+        # the prompt contains a literal JSON milestone example that would
+        # otherwise break .format().
+        prompt = kpi_prompt_template
+        prompt = prompt.replace("{task}", task)
+        prompt = prompt.replace("{agent_results}", agent_results)
         # Call the language model
         result = model_prompting(
             llm_model=self.llm,
