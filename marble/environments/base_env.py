@@ -27,6 +27,7 @@ class BaseEnvironment:
         self.ground_truth: str = config.get("ground_truth", "")
         self.max_iterations: int = config.get("max_iterations", 10)
         self.current_iteration: int = 0
+        self.token_usage: int = 0
         # Initialize the state with the task description
         self.state["task_description"] = self.task_description
 

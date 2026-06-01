@@ -4,6 +4,7 @@ import os
 import re
 from typing import Any, Dict
 
+from litellm.utils import token_counter
 from ruamel.yaml import YAML
 
 from marble.llms.model_prompting import model_prompting
@@ -95,16 +96,22 @@ def give_advice_and_revise_handler(
             "Provide ONE most critical suggestion in the specified format."
         )
 
+        advice_messages = [
+            {"role": "system", "content": system_prompt_advice},
+            {"role": "user", "content": user_prompt_advice},
+        ]
         response_advice = model_prompting(
             model_name,
-            messages=[
-                {"role": "system", "content": system_prompt_advice},
-                {"role": "user", "content": user_prompt_advice},
-            ],
+            messages=advice_messages,
             return_num=1,
             max_token_num=4096,
             temperature=0.0,
         )[0]
+        env.token_usage += token_counter(
+            model=model_name,
+            messages=advice_messages
+            + [{"role": "assistant", "content": response_advice.content or ""}],
+        )
 
         # Step 2: Generate modification strategy
         system_prompt_strategy = (
@@ -135,16 +142,22 @@ def give_advice_and_revise_handler(
             "Provide specific modification strategies in the specified JSON format."
         )
 
+        strategy_messages = [
+            {"role": "system", "content": system_prompt_strategy},
+            {"role": "user", "content": user_prompt_strategy},
+        ]
         response_strategy = model_prompting(
             model_name,
-            messages=[
-                {"role": "system", "content": system_prompt_strategy},
-                {"role": "user", "content": user_prompt_strategy},
-            ],
+            messages=strategy_messages,
             return_num=1,
             max_token_num=4096,
             temperature=0.0,
         )[0]
+        env.token_usage += token_counter(
+            model=model_name,
+            messages=strategy_messages
+            + [{"role": "assistant", "content": response_strategy.content or ""}],
+        )
 
         # 记录原始响应
         debug_info = f"Raw response content:\n{response_strategy.content}\n"

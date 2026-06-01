@@ -1581,9 +1581,10 @@ class Engine:
 
     def _get_totoal_token_usage(self) -> int:
         """
-        Get the total token usage by all agents.
+        Get the total token usage by agents, planner, and LLM-backed tools.
         """
         return (
             sum(agent.token_usage for agent in self.graph.get_all_agents())
             + self.planner.token_usage
+            + getattr(self.environment, "token_usage", 0)
         )

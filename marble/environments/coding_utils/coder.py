@@ -2,6 +2,7 @@ import os
 import re
 from typing import Any, Dict
 
+from litellm.utils import token_counter
 from ruamel.yaml import YAML
 
 from marble.llms.model_prompting import model_prompting
@@ -71,16 +72,22 @@ def create_solution_handler(
 
         user_prompt = "Please write the complete Python code for this task."
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         response = model_prompting(
             model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             return_num=1,
             max_token_num=4096,
             temperature=0.0,
         )[0]
+        env.token_usage += token_counter(
+            model=model_name,
+            messages=messages
+            + [{"role": "assistant", "content": response.content or ""}],
+        )
 
         code_content = response.content
 
