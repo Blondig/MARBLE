@@ -1342,10 +1342,16 @@ class Engine:
                 agent_tasks = self._format_agent_tasks(
                     {agent.agent_id: self.task for agent in agents}
                 )
-                self.evaluator.evaluate_planning(
-                    final_output, agent_profiles, agent_tasks, final_output
+                # Feed the judge each agent's labeled output so KPI can attribute
+                # milestones to the right agent IDs (not just the final answer).
+                agent_results_str = "\n".join(
+                    f"From {a['agent_id']}: {a['output']}"
+                    for a in summary_data["agents"]
                 )
-                self.evaluator.evaluate_kpi(self.task, final_output)
+                self.evaluator.evaluate_planning(
+                    final_output, agent_profiles, agent_tasks, agent_results_str
+                )
+                self.evaluator.evaluate_kpi(self.task, agent_results_str)
             except Exception:
                 self.logger.exception("Fixed-chain planning/KPI evaluation failed.")
                 self.evaluator.metrics["planning_score"].append(-1)
