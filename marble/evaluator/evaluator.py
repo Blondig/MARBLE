@@ -150,12 +150,10 @@ class Evaluator:
         if len(agent_results) > MAX_LENGTH:
             agent_results = agent_results[:MAX_LENGTH] + "..."
         kpi_prompt_template = self.evaluation_prompts["Graph"]["KPI"]["prompt"]
-        # Fill in the placeholders via targeted replacement (not str.format):
-        # the prompt contains a literal JSON milestone example that would
-        # otherwise break .format().
-        prompt = kpi_prompt_template
-        prompt = prompt.replace("{task}", task)
-        prompt = prompt.replace("{agent_results}", agent_results)
+        # Fill in the placeholders {task} and {agent_results}. The KPI prompt's
+        # literal JSON example is already brace-escaped ({{...}}), so the
+        # original .format() renders it correctly.
+        prompt = kpi_prompt_template.format(task=task, agent_results=agent_results)
         # Call the language model
         result = model_prompting(
             llm_model=self.llm,
@@ -172,7 +170,9 @@ class Evaluator:
         # Update the metrics
         self.metrics["total_milestones"] += len(milestones)
         for milestone in milestones:
-            agents = milestone.get("contributing_agents", [])
+            # The KPI prompt asks the judge for the key "agents" (not
+            # "contributing_agents"); read the key the prompt actually emits.
+            agents = milestone.get("agents", [])
             for agent_id in agents:
                 if agent_id in self.metrics["agent_kpis"]:
                     self.metrics["agent_kpis"][agent_id] += 1
