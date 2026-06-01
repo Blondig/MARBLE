@@ -33,7 +33,12 @@ def model_prompting(
     elif "together_ai/TA" in llm_model:
         base_url = "https://api.ohmygpt.com/v1"
     else:
-        base_url = None
+        # Catch-all: any other model name (e.g., "gpt-3.5-turbo" injected by
+        # coding-tool arguments, or any leftover config model) is forced onto
+        # the local Qwen3-8B vLLM, so everything runs on the local model.
+        llm_model = "openai/Qwen3-8B"
+        base_url = "http://localhost:9999/v1"
+        extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
     completion = litellm.completion(
         model=llm_model,
         messages=messages,
