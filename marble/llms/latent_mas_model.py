@@ -45,6 +45,18 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
 
 
 def _past_length(past_key_values: Optional[Tuple]) -> int:
+    if past_key_values is None:
+        return 0
+    if Cache is not None and isinstance(past_key_values, Cache):
+        if hasattr(past_key_values, "get_seq_length"):
+            try:
+                return int(past_key_values.get_seq_length())
+            except TypeError:
+                return int(past_key_values.get_seq_length(0))
+        legacy = past_key_values.to_legacy_cache()
+        if not legacy:
+            return 0
+        return legacy[0][0].shape[-2]
     if not past_key_values:
         return 0
     k = past_key_values[0][0]
@@ -548,7 +560,7 @@ class ModelWrapper:
         latent embeddings into its own carried KV, so the neighbour's latent prefix
         is not copied into this agent's long-term cache.
         """
-        kv_for_context = self._as_legacy(past_key_values)
+        kv_for_context = self._copy_cache(past_key_values)
         context_combined = self._build_prompt_embeds(
             prompt_text, neighbor_latents, insert_marker=insert_marker
         )
@@ -559,7 +571,7 @@ class ModelWrapper:
             return_latent_embeds=True,
         )
 
-        kv_for_persist = self._as_legacy(past_key_values)
+        kv_for_persist = past_key_values
         prompt_only = self._build_prompt_embeds(prompt_text, None)
         own_segment = torch.cat([prompt_only, contextual_embeds], dim=1)
         own_past = self.generate_latent_batch(
@@ -587,6 +599,30 @@ class ModelWrapper:
             return past.to_legacy_cache()  # type: ignore[no-any-return]
         return past  # type: ignore[return-value]
 
+    @staticmethod
+    def _copy_cache(past: Optional[object]) -> Optional[object]:
+        """Copy a cache container without forcing new-transformers Cache to tuple."""
+        if past is None:
+            return None
+        if (
+            Cache is not None
+            and isinstance(past, Cache)
+            and hasattr(past, "to_legacy_cache")
+            and hasattr(past.__class__, "from_legacy_cache")
+        ):
+            legacy = past.to_legacy_cache()
+            copied_legacy = tuple(
+                tuple(t for t in layer) if isinstance(layer, tuple) else layer
+                for layer in legacy
+            )
+            return past.__class__.from_legacy_cache(copied_legacy)
+        if isinstance(past, tuple):
+            return tuple(
+                tuple(t for t in layer) if isinstance(layer, tuple) else layer
+                for layer in past
+            )
+        return past
+
     @torch.no_grad()
     def decode_bool(
         self,
@@ -600,10 +636,10 @@ class ModelWrapper:
         working memory, without decoding full content (greedy, a few tokens).
 
         Used for control decisions (e.g. "should this dialogue stop?", "is the
-        task complete?"). Operates on a legacy-tuple view so the caller's KV is
-        not mutated by the generate() append.
+        task complete?"). Operates on a copied cache container so the caller's KV
+        is not mutated by the generate() append.
         """
-        kv = self._as_legacy(past_key_values)
+        kv = self._copy_cache(past_key_values)
         msgs = [
             {
                 "role": "user",
@@ -708,19 +744,17 @@ class ModelWrapper:
         Returns the accumulated KV (the dialogue's latent outcome); no text
         summary is produced -- the KV itself is the takeaway.
         """
-        kv = self._as_legacy(past_key_values)
+        kv = self._copy_cache(past_key_values)
         # Responder speaks first, mirroring the original (target agent answers).
         roles = [responder_msgs, initiator_msgs]
         for t in range(max_turns):
             msgs = roles[t % 2]
             _, input_ids, attention_mask, _ = self.prepare_chat_batch([msgs])
-            kv = self._as_legacy(
-                self.generate_latent_batch(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    latent_steps=latent_steps,
-                    past_key_values=kv,
-                )
+            kv = self.generate_latent_batch(
+                input_ids,
+                attention_mask=attention_mask,
+                latent_steps=latent_steps,
+                past_key_values=kv,
             )
             if self.decode_bool(
                 kv,
