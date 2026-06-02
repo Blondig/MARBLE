@@ -25,7 +25,7 @@ torch/transformers are imported at module load, so this module is only imported
 lazily by the engine when ``coordinate_mode: latent`` is configured.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -330,7 +330,18 @@ class ModelWrapper:
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
-    ) -> Tuple:
+        return_latent_embeds: bool = False,
+    ) -> Any:
+        """Coconut-style latent reasoning; returns the accumulated KV cache.
+
+        If ``return_latent_embeds`` is True, also returns the sequence of latent
+        embeddings produced this call as ``(past, embeds)`` where ``embeds`` is
+        ``[B, latent_steps, H]`` in input-embedding space. These are the agent's
+        "thoughts"; the hierarchical judger attends them via embedding insertion
+        (RoPE applied fresh), exactly as LatentMAS's hierarchical path harvests
+        ``embedding_record``. The KV itself is left intact (the agent keeps it as
+        its own working memory).
+        """
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
 
@@ -361,9 +372,12 @@ class ModelWrapper:
 
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
 
+        latent_vecs: List[torch.Tensor] = []
         for step in range(latent_steps):
             latent_vec = self._apply_latent_realignment(last_hidden, self.model)
             latent_embed = latent_vec.unsqueeze(1)
+            if return_latent_embeds:
+                latent_vecs.append(latent_embed)
 
             past_len = _past_length(past)
             latent_mask = torch.ones(
@@ -382,7 +396,83 @@ class ModelWrapper:
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
+        if return_latent_embeds:
+            if latent_vecs:
+                embeds = torch.cat(latent_vecs, dim=1)
+            else:
+                embeds = last_hidden.new_zeros(
+                    (input_ids.shape[0], 0, last_hidden.shape[-1])
+                )
+            return past, embeds
         return past
+
+    @torch.no_grad()
+    def generate_text_from_embeds(
+        self,
+        prompt_text: str,
+        latent_embeds: List[torch.Tensor],
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        insert_marker: str = "<|im_start|>user\n",
+    ) -> str:
+        """
+        Hierarchical aggregation: decode text from a prompt with the per-agent
+        latent "thoughts" inserted as INPUT EMBEDDINGS (so RoPE is applied fresh
+        over the whole sequence -- no KV-position mismatch). This mirrors
+        LatentMAS's hierarchical judger, which concatenates each agent's
+        ``embedding_record`` and inserts it after the user header before decoding.
+        The judger thus reads every agent's latent without any KV merge.
+
+        prompt_text:   the judger's rendered chat prompt (single sample).
+        latent_embeds: list of ``[1, steps_i, H]`` tensors, one per agent
+                       (read-only views of the agents' latent; never mutated).
+        """
+        enc = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        input_ids = enc["input_ids"].to(self.device)
+        embed_layer = self.model.get_input_embeddings()
+        prompt_embeds = embed_layer(input_ids)  # [1, L, H]
+
+        blocks = [
+            e.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+            for e in latent_embeds
+            if e is not None and e.shape[1] > 0
+        ]
+        latent_block = torch.cat(blocks, dim=1) if blocks else None
+
+        if latent_block is None:
+            combined = prompt_embeds
+        else:
+            idx = prompt_text.find(insert_marker)
+            if idx != -1:
+                left_text = prompt_text[: idx + len(insert_marker)]
+                left_len = len(
+                    self.tokenizer(left_text, add_special_tokens=False)["input_ids"]
+                )
+                left = prompt_embeds[:, :left_len, :]
+                right = prompt_embeds[:, left_len:, :]
+                combined = torch.cat([left, latent_block, right], dim=1)
+            else:
+                combined = torch.cat([latent_block, prompt_embeds], dim=1)
+
+        attention_mask = torch.ones(
+            combined.shape[:2], dtype=torch.long, device=combined.device
+        )
+        outputs = self.model.generate(
+            inputs_embeds=combined,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+        # With inputs_embeds (no input_ids), generate() returns only new tokens.
+        gen_ids = outputs.sequences[0]
+        return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
     # ------------------------------------------------------------------ #
     # Latent-MAS additions (graph-latent building blocks).

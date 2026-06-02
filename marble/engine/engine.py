@@ -1281,6 +1281,59 @@ class Engine:
             {"role": "user", "content": user},
         ]
 
+    def _build_graph_latent_worker_msg(
+        self, agent: BaseAgent, first_round: bool, prior_summary: str
+    ) -> List[Dict[str, str]]:
+        """One worker (graph node) message for graph_latent_coordinate.
+
+        Round 1 encodes the FULL task (it then lives in the agent's own KV).
+        Round >= 2 feeds only a short "continue" instruction + the latest team
+        summary -- the task is NOT restated, so the carried KV grows by a small
+        delta instead of re-pasting the task (the cause of the KV blow-up).
+        """
+        profile = agent.get_profile()
+        if first_round:
+            user = (
+                f"You are {agent.agent_id}: {profile}\n"
+                f"Task: {self.task}\n"
+                "Reason toward solving this task from your role's perspective. "
+                "Your reasoning is shared with the team as latent working memory."
+            )
+        else:
+            user = (
+                f"You are {agent.agent_id}: {profile}\n"
+                "Continue and improve your reasoning for the same task (it is "
+                "already in your working memory -- do NOT restate it).\n"
+                f"Latest team summary:\n{prior_summary}\n"
+            )
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": user},
+        ]
+
+    def _build_graph_latent_judger_msg(
+        self, judger: BaseAgent
+    ) -> List[Dict[str, str]]:
+        """The judger/summarizer message for graph_latent_coordinate.
+
+        The other agents' latent thoughts are inserted as input embeddings by
+        ModelWrapper.generate_text_from_embeds (hierarchical aggregation), so the
+        prompt itself only carries the task once and the output-format request.
+        """
+        profile = judger.get_profile()
+        user = (
+            f"You are {judger.agent_id}, the team summarizer: {profile}\n"
+            f"Task: {self.task}\n"
+            "You are given the other agents' latent reasoning as working memory. "
+            "Use it as reference (ignore irrelevant parts) and produce the final "
+            "answer to the task.\n"
+            f"Output format: {self.output_format}"
+        )
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": user},
+        ]
+
     def fixed_chain_coordinate(self) -> None:
         """
         Fixed-pipeline TEXT baseline, structurally mirroring latent_coordinate.
@@ -1447,24 +1500,26 @@ class Engine:
 
     def graph_latent_coordinate(self) -> None:
         """
-        Graph-latent coordination (B1 approximation).
+        Graph-latent coordination (v1 skeleton: per-agent KV + hierarchical
+        aggregation). NOT a literal latent replica of graph_coordinate.
 
-        IMPORTANT -- this is NOT a literal latent replica of graph_coordinate.
-        It is a LatentMAS-hierarchical analogue with a MARBLE-style round loop:
-        per round one KV cache is threaded sequentially through the worker agents
-        (LatentMAS run_batch threading, NOT a merge), then the judger decodes the
-        round answer from the accumulated KV (replaces summarize_output), and a
-        decoded true/false (decode_bool) replaces decide_next_step.
+        Structure (faithful to graph's node-independence + LatentMAS parts):
+        - Each graph node = one agent with its OWN latent working memory (kv_i),
+          carried across rounds and never cleared. Round 1 encodes the full task;
+          round >= 2 feeds only a short "continue + latest summary" instruction
+          (task already in kv_i) so the KV grows by a small delta per round.
+        - A node only writes its OWN kv_i; latent is shared READ-ONLY, so there is
+          no KV merge and no cross-agent pollution.
+        - Round aggregation = LatentMAS hierarchical: the judger/summarizer attends
+          each agent's latent "thoughts" via embedding insertion
+          (generate_text_from_embeds, RoPE fresh) and decodes the round answer.
+        - Stop = a tiny PLAINTEXT control decode (decode_bool) over the round's
+          text answer, replacing decide_next_step.
 
-        Known divergences from graph_coordinate (inherent to latent or by design):
-        - Inherent: latent agents emit only KV, no per-agent text results, so the
-          "all agents act -> per-agent text results -> planner aggregation" of
-          graph cannot be reproduced; planning uses the judger's decoded answer,
-          and KPI/communication are N/A (see below). Relationships/edges are not
-          used (graph uses them only for new_communication_session anyway).
-        - By design: no agent<->tool channel (judger decodes the answer/code
-          directly); stop is decode_bool, not the text decide_next_step. Tool-
-          using benchmarks (db/research/minecraft) need the future B2 path.
+        Deferred to a later step (interface stubbed in the worker loop):
+        - Part A "side": edge-gated, plaintext-routed latent dialogue along
+          self.relationships (read-only attend of a neighbour's latent).
+        - agent<->tool channel for tool-using benchmarks (db/research/minecraft).
 
         Output schema matches graph_coordinate (iterations/planning_scores/
         communication_scores/agent_kpis/total_milestones/token_usage/
@@ -1473,11 +1528,7 @@ class Engine:
         """
         import torch
 
-        from marble.llms.latent_mas_model import (
-            ModelWrapper,
-            _past_length,
-            truncate_past,
-        )
+        from marble.llms.latent_mas_model import ModelWrapper
 
         cfg = self.config.latent or {}
         model_name = cfg.get("model_name", "Qwen/Qwen2.5-7B-Instruct")
@@ -1486,10 +1537,6 @@ class Engine:
         temperature = float(cfg.get("temperature", 0.7))
         top_p = float(cfg.get("top_p", 0.95))
         latent_space_realign = bool(cfg.get("latent_space_realign", False))
-        latent_only = bool(cfg.get("latent_only", False))
-        sequential_info_only = (
-            bool(cfg.get("sequential_info_only", False)) or latent_only
-        )
         device = torch.device(
             cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -1520,42 +1567,52 @@ class Engine:
                 {agent.agent_id: self.task for agent in agents}
             )
 
-            past_kv: Optional[Any] = None
+            # Per-agent latent working memory (kv_i), carried across rounds and
+            # NEVER cleared: each graph node keeps its own KV. Round 1 encodes the
+            # full task; round >= 2 feeds only a short "continue" instruction (the
+            # task already lives in kv_i), so each KV grows by a small delta per
+            # round instead of re-pasting the task (the prior KV blow-up). Only the
+            # agent itself writes its KV (read-only sharing -> no merge, no
+            # cross-agent pollution).
+            agent_kvs: Dict[str, Any] = {a.agent_id: None for a in workers}
             total_latent_steps = 0
             final_output = ""
+            prior_summary = ""
             for rnd in range(max(1, self.max_iterations)):
-                # Workers: thread ONE KV through them (latent reasoning).
+                # Each worker reasons in latent on its OWN carried KV, and exposes
+                # its latent "thoughts" (embeds) for the judger to attend.
+                round_latent_embeds: List[Any] = []
                 for agent in workers:
-                    messages = self._build_latent_messages(
-                        agent, has_context=past_kv is not None, is_judger=False
+                    first_round = agent_kvs[agent.agent_id] is None
+                    messages = self._build_graph_latent_worker_msg(
+                        agent, first_round=first_round, prior_summary=prior_summary
                     )
                     _, ids, mask, _ = model.prepare_chat_batch([messages])
-                    prev_len = _past_length(past_kv)
-                    past_kv = model.generate_latent_batch(
+                    # TODO(side, deferred): before generating, read-only attend a
+                    # graph neighbour's latent here (insert its embeds), gated by a
+                    # plaintext routing decode over self.relationships. v1: off.
+                    kv_new, embeds = model.generate_latent_batch(
                         ids,
                         attention_mask=mask,
                         latent_steps=latent_steps,
-                        past_key_values=past_kv,
+                        past_key_values=agent_kvs[agent.agent_id],
+                        return_latent_embeds=True,
                     )
-                    if sequential_info_only:
-                        added = _past_length(past_kv) - prev_len
-                        keep = latent_steps if latent_only else added
-                        past_kv = truncate_past(past_kv, keep)
+                    agent_kvs[agent.agent_id] = kv_new  # carry forward, no clear
+                    round_latent_embeds.append(embeds)
                     total_latent_steps += latent_steps
-                # Judger: decode this round's answer from the accumulated KV.
-                jmsg = self._build_latent_messages(
-                    judger, has_context=past_kv is not None, is_judger=True
-                )
-                _, jids, jmask, _ = model.prepare_chat_batch([jmsg])
-                gens, _ = model.generate_text_batch(
-                    jids,
-                    jmask,
+                # Judger (hierarchical summarizer): attend each agent's latent via
+                # embedding insertion (RoPE fresh), then decode the round answer.
+                jmsg = self._build_graph_latent_judger_msg(judger)
+                jprompt = model.render_chat(jmsg, add_generation_prompt=True)
+                final_output = model.generate_text_from_embeds(
+                    jprompt,
+                    round_latent_embeds,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
-                    past_key_values=past_kv if latent_steps > 0 else None,
-                )
-                final_output = gens[0].strip()
+                ).strip()
+                prior_summary = final_output
 
                 # Scoring, mirroring graph_coordinate's fields. Latent agents
                 # exchange no text -> communication is -1 (as graph). Planning is
@@ -1572,9 +1629,10 @@ class Engine:
                     self.logger.exception("graph-latent planning evaluation failed.")
                     self.evaluator.metrics["planning_score"].append(-1)
 
-                # Stop decision: decoded true/false (replaces decide_next_step).
+                # Stop decision: a clean PLAINTEXT control decode over the round's
+                # text answer (no latent-KV pollution; replaces decide_next_step).
                 solved = model.decode_bool(
-                    past_kv,
+                    None,
                     "Considering the task and the latest answer, is the task fully "
                     f"and correctly solved?\nTask: {self.task[:800]}\n"
                     f"Latest answer: {final_output[:800]}",
