@@ -99,6 +99,7 @@ class ModelWrapper:
         self.device = device
         self.latent_space_realign = bool(latent_space_realign)
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.token_usage = 0
         # for ablation parity with upstream
         self.pre_aligned = None
 
@@ -308,11 +309,14 @@ class ModelWrapper:
         )
         sequences = outputs.sequences
         generations: List[str] = []
+        decoded_tokens = 0
         for idx, length in enumerate(prompt_lengths):
             length = int(length)
             generated_ids = sequences[idx, length:]
+            decoded_tokens += int(generated_ids.numel())
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
             generations.append(text)
+        self.token_usage += int(input_ids.numel()) + decoded_tokens
         return generations, outputs.past_key_values
 
     def tokenize_text(self, text: str) -> torch.Tensor:
@@ -325,14 +329,21 @@ class ModelWrapper:
     @torch.no_grad()
     def generate_latent_batch(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
         return_latent_embeds: bool = False,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Any:
         """Coconut-style latent reasoning; returns the accumulated KV cache.
+
+        The first forward consumes ``input_ids`` (default path, unchanged from
+        upstream) OR ``inputs_embeds`` ``[B, L, H]``. The returned KV contains
+        those consumed positions plus the latent positions generated below. For
+        graph-latent read-only side context, use ``generate_latent_with_context``
+        instead of storing this return value directly.
 
         If ``return_latent_embeds`` is True, also returns the sequence of latent
         embeddings produced this call as ``(past, embeds)`` where ``embeds`` is
@@ -342,14 +353,28 @@ class ModelWrapper:
         ``embedding_record``. The KV itself is left intact (the agent keeps it as
         its own working memory).
         """
-        if input_ids.dim() != 2:
-            raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=self.device)
+        use_embeds = inputs_embeds is not None
+        if use_embeds:
+            if inputs_embeds.dim() != 3:
+                raise ValueError("inputs_embeds must be 3D [batch, seq_len, hidden]")
+            inputs_embeds = inputs_embeds.to(self.device)
+            batch, seq_len = inputs_embeds.shape[0], inputs_embeds.shape[1]
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    (batch, seq_len), dtype=torch.long, device=self.device
+                )
+            else:
+                attention_mask = attention_mask.to(self.device)
         else:
-            attention_mask = attention_mask.to(self.device)
+            if input_ids is None or input_ids.dim() != 2:
+                raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
+            batch, seq_len = input_ids.shape[0], input_ids.shape[1]
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, device=self.device)
+            else:
+                attention_mask = attention_mask.to(self.device)
 
+        cache_position = None
         if past_key_values is not None:
             past_len = _past_length(past_key_values)
             if past_len > 0:
@@ -359,15 +384,32 @@ class ModelWrapper:
                     device=attention_mask.device,
                 )
                 attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
+                if use_embeds:
+                    # input_ids+past lets transformers infer positions from the
+                    # mask; inputs_embeds+past needs them spelled out.
+                    cache_position = torch.arange(
+                        past_len, past_len + seq_len, dtype=torch.long, device=self.device
+                    )
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        if use_embeds:
+            outputs = self.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+                cache_position=cache_position,
+            )
+        else:
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
         past = outputs.past_key_values
 
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
@@ -396,15 +438,52 @@ class ModelWrapper:
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
+        self.token_usage += int(batch * (seq_len + latent_steps))
         if return_latent_embeds:
             if latent_vecs:
                 embeds = torch.cat(latent_vecs, dim=1)
             else:
-                embeds = last_hidden.new_zeros(
-                    (input_ids.shape[0], 0, last_hidden.shape[-1])
-                )
+                embeds = last_hidden.new_zeros((batch, 0, last_hidden.shape[-1]))
             return past, embeds
         return past
+
+    def _build_prompt_embeds(
+        self,
+        prompt_text: str,
+        latent_embeds: Optional[List[torch.Tensor]] = None,
+        *,
+        insert_marker: str = "<|im_start|>user\n",
+    ) -> torch.Tensor:
+        """Embed ``prompt_text`` and insert source latent embeds right after the
+        user header (RoPE applied fresh downstream). Returns ``[1, L', H]``.
+
+        Shared by the hierarchical judger (reads ALL agents' latent) and the
+        "side" channel (a worker reads ONE neighbour's latent). The latent is
+        consumed READ-ONLY -- never written back into any KV (no merge).
+        """
+        enc = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        input_ids = enc["input_ids"].to(self.device)
+        prompt_embeds = self.model.get_input_embeddings()(input_ids)  # [1, L, H]
+
+        blocks = [
+            e.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+            for e in (latent_embeds or [])
+            if e is not None and e.shape[1] > 0
+        ]
+        if not blocks:
+            return prompt_embeds
+        latent_block = torch.cat(blocks, dim=1)
+        idx = prompt_text.find(insert_marker)
+        if idx != -1:
+            left_len = len(
+                self.tokenizer(
+                    prompt_text[: idx + len(insert_marker)], add_special_tokens=False
+                )["input_ids"]
+            )
+            left = prompt_embeds[:, :left_len, :]
+            right = prompt_embeds[:, left_len:, :]
+            return torch.cat([left, latent_block, right], dim=1)
+        return torch.cat([latent_block, prompt_embeds], dim=1)
 
     @torch.no_grad()
     def generate_text_from_embeds(
@@ -419,43 +498,18 @@ class ModelWrapper:
     ) -> str:
         """
         Hierarchical aggregation: decode text from a prompt with the per-agent
-        latent "thoughts" inserted as INPUT EMBEDDINGS (so RoPE is applied fresh
-        over the whole sequence -- no KV-position mismatch). This mirrors
-        LatentMAS's hierarchical judger, which concatenates each agent's
-        ``embedding_record`` and inserts it after the user header before decoding.
-        The judger thus reads every agent's latent without any KV merge.
+        latent "thoughts" inserted as INPUT EMBEDDINGS (RoPE applied fresh over the
+        whole sequence -- no KV-position mismatch). Mirrors LatentMAS's hierarchical
+        judger (concatenated ``embedding_record`` inserted after the user header).
+        Reads every agent's latent without any KV merge.
 
         prompt_text:   the judger's rendered chat prompt (single sample).
         latent_embeds: list of ``[1, steps_i, H]`` tensors, one per agent
                        (read-only views of the agents' latent; never mutated).
         """
-        enc = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
-        input_ids = enc["input_ids"].to(self.device)
-        embed_layer = self.model.get_input_embeddings()
-        prompt_embeds = embed_layer(input_ids)  # [1, L, H]
-
-        blocks = [
-            e.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
-            for e in latent_embeds
-            if e is not None and e.shape[1] > 0
-        ]
-        latent_block = torch.cat(blocks, dim=1) if blocks else None
-
-        if latent_block is None:
-            combined = prompt_embeds
-        else:
-            idx = prompt_text.find(insert_marker)
-            if idx != -1:
-                left_text = prompt_text[: idx + len(insert_marker)]
-                left_len = len(
-                    self.tokenizer(left_text, add_special_tokens=False)["input_ids"]
-                )
-                left = prompt_embeds[:, :left_len, :]
-                right = prompt_embeds[:, left_len:, :]
-                combined = torch.cat([left, latent_block, right], dim=1)
-            else:
-                combined = torch.cat([latent_block, prompt_embeds], dim=1)
-
+        combined = self._build_prompt_embeds(
+            prompt_text, latent_embeds, insert_marker=insert_marker
+        )
         attention_mask = torch.ones(
             combined.shape[:2], dtype=torch.long, device=combined.device
         )
@@ -472,7 +526,51 @@ class ModelWrapper:
         )
         # With inputs_embeds (no input_ids), generate() returns only new tokens.
         gen_ids = outputs.sequences[0]
+        self.token_usage += int(combined.shape[0] * combined.shape[1] + gen_ids.numel())
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+    @torch.no_grad()
+    def generate_latent_with_context(
+        self,
+        prompt_text: str,
+        past_key_values: Optional[Tuple],
+        *,
+        latent_steps: int,
+        neighbor_latents: Optional[List[torch.Tensor]] = None,
+        return_latent_embeds: bool = True,
+        insert_marker: str = "<|im_start|>user\n",
+    ) -> Any:
+        """Latent reasoning with read-only neighbour latent side context.
+
+        A temporary pass inserts neighbour latent embeddings into the prompt and
+        generates this agent's new latent embeddings. That temporary KV is
+        discarded. A second pass persists only this agent's prompt plus the new
+        latent embeddings into its own carried KV, so the neighbour's latent prefix
+        is not copied into this agent's long-term cache.
+        """
+        kv_for_context = self._as_legacy(past_key_values)
+        context_combined = self._build_prompt_embeds(
+            prompt_text, neighbor_latents, insert_marker=insert_marker
+        )
+        _, contextual_embeds = self.generate_latent_batch(
+            inputs_embeds=context_combined,
+            latent_steps=latent_steps,
+            past_key_values=kv_for_context,
+            return_latent_embeds=True,
+        )
+
+        kv_for_persist = self._as_legacy(past_key_values)
+        prompt_only = self._build_prompt_embeds(prompt_text, None)
+        own_segment = torch.cat([prompt_only, contextual_embeds], dim=1)
+        own_past = self.generate_latent_batch(
+            inputs_embeds=own_segment,
+            latent_steps=0,
+            past_key_values=kv_for_persist,
+            return_latent_embeds=False,
+        )
+        if return_latent_embeds:
+            return own_past, contextual_embeds
+        return own_past
 
     # ------------------------------------------------------------------ #
     # Latent-MAS additions (graph-latent building blocks).
@@ -540,8 +638,55 @@ class ModelWrapper:
             cache_position=cache_position,
         )
         gen = out[0, input_ids.shape[-1] :]
+        self.token_usage += int(input_ids.numel() + gen.numel())
         ans = self.tokenizer.decode(gen, skip_special_tokens=True).strip().lower()
         return ans.startswith("true") or ans.startswith("yes")
+
+    @torch.no_grad()
+    def decode_choice(
+        self,
+        question: str,
+        options: List[str],
+        *,
+        max_new_tokens: int = 12,
+    ) -> Optional[str]:
+        """Decode a short plaintext CONTROL choice from a fixed option set (greedy,
+        a few tokens, no KV). Returns the matched option, or None for "none"/no match.
+
+        Used for graph-latent routing -- "consult which neighbour?" -- mirroring the
+        new_communication_session tool call (whether + whom) in plaintext, while the
+        exchanged CONTENT stays latent.
+        """
+        if not options:
+            return None
+        listed = ", ".join(list(options) + ["none"])
+        msgs = [
+            {
+                "role": "user",
+                "content": f"{question}\nReply with exactly one of: {listed}.",
+            }
+        ]
+        prompt = self.render_chat(msgs, add_generation_prompt=True)
+        enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+        out = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        gen = out[0, input_ids.shape[-1] :]
+        self.token_usage += int(input_ids.numel() + gen.numel())
+        ans = self.tokenizer.decode(gen, skip_special_tokens=True).strip().lower()
+        ans_clean = ans.strip(" \t\r\n.,:;\"'")
+        if ans_clean in {"none", "no", "n/a"}:
+            return None
+        for opt in options:
+            if ans_clean == opt.lower():
+                return opt
+        return None
 
     @torch.no_grad()
     def latent_dialogue(

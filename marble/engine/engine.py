@@ -1160,6 +1160,9 @@ class Engine:
             # Score planning/KPI/task with the original evaluator (see
             # _evaluate_latent); communication stays N/A for latent.
             self._evaluate_latent(summary_data, final_output, agents)
+            summary_data["token_usage"] = (
+                self._get_totoal_token_usage() + getattr(model, "token_usage", 0)
+            )
 
         except Exception:
             self.logger.exception("An error occurred during latent coordination.")
@@ -1508,17 +1511,17 @@ class Engine:
           carried across rounds and never cleared. Round 1 encodes the full task;
           round >= 2 feeds only a short "continue + latest summary" instruction
           (task already in kv_i) so the KV grows by a small delta per round.
-        - A node only writes its OWN kv_i; latent is shared READ-ONLY, so there is
-          no KV merge and no cross-agent pollution.
+        - Side communication reads a neighbour's latest latent thoughts as
+          temporary input embeddings, then persists only this agent's updated
+          working memory. This keeps per-agent KV isolated while still allowing
+          latent influence across graph edges.
         - Round aggregation = LatentMAS hierarchical: the judger/summarizer attends
           each agent's latent "thoughts" via embedding insertion
           (generate_text_from_embeds, RoPE fresh) and decodes the round answer.
         - Stop = a tiny PLAINTEXT control decode (decode_bool) over the round's
           text answer, replacing decide_next_step.
 
-        Deferred to a later step (interface stubbed in the worker loop):
-        - Part A "side": edge-gated, plaintext-routed latent dialogue along
-          self.relationships (read-only attend of a neighbour's latent).
+        Deferred to a later step:
         - agent<->tool channel for tool-using benchmarks (db/research/minecraft).
 
         Output schema matches graph_coordinate (iterations/planning_scores/
@@ -1571,10 +1574,12 @@ class Engine:
             # NEVER cleared: each graph node keeps its own KV. Round 1 encodes the
             # full task; round >= 2 feeds only a short "continue" instruction (the
             # task already lives in kv_i), so each KV grows by a small delta per
-            # round instead of re-pasting the task (the prior KV blow-up). Only the
-            # agent itself writes its KV (read-only sharing -> no merge, no
-            # cross-agent pollution).
+            # round instead of re-pasting the task.
             agent_kvs: Dict[str, Any] = {a.agent_id: None for a in workers}
+            # Latest latent "thoughts" each agent has produced; neighbours read
+            # these as temporary side context, and the judger reads them via
+            # embedding insertion for hierarchical aggregation.
+            agent_latents: Dict[str, Any] = {}
             total_latent_steps = 0
             final_output = ""
             prior_summary = ""
@@ -1582,23 +1587,60 @@ class Engine:
                 # Each worker reasons in latent on its OWN carried KV, and exposes
                 # its latent "thoughts" (embeds) for the judger to attend.
                 round_latent_embeds: List[Any] = []
+                round_comms: List[Dict[str, str]] = []
                 for agent in workers:
                     first_round = agent_kvs[agent.agent_id] is None
                     messages = self._build_graph_latent_worker_msg(
                         agent, first_round=first_round, prior_summary=prior_summary
                     )
-                    _, ids, mask, _ = model.prepare_chat_batch([messages])
-                    # TODO(side, deferred): before generating, read-only attend a
-                    # graph neighbour's latent here (insert its embeds), gated by a
-                    # plaintext routing decode over self.relationships. v1: off.
-                    kv_new, embeds = model.generate_latent_batch(
-                        ids,
-                        attention_mask=mask,
-                        latent_steps=latent_steps,
-                        past_key_values=agent_kvs[agent.agent_id],
-                        return_latent_embeds=True,
-                    )
+                    prompt = model.render_chat(messages, add_generation_prompt=True)
+
+                    # Part A (side): edge-gated + plaintext-routed latent side context.
+                    # Candidates = graph neighbours whose latent is already available.
+                    candidates = [
+                        n
+                        for n in self._graph_neighbors(agent.agent_id)
+                        if agent_latents.get(n) is not None
+                    ]
+                    chosen = None
+                    if candidates:
+                        chosen = model.decode_choice(
+                            f"You are {agent.agent_id} ({agent.get_profile()}). To "
+                            "help solve the task, whose latent reasoning would you "
+                            "consult?",
+                            candidates,
+                        )
+                    if chosen:
+                        # Read the neighbour's latest latent side context without
+                        # copying the neighbour's KV into this agent's carried KV.
+                        kv_new, embeds = model.generate_latent_with_context(
+                            prompt,
+                            agent_kvs[agent.agent_id],
+                            latent_steps=latent_steps,
+                            neighbor_latents=[agent_latents[chosen]],
+                        )
+                        round_comms.append(
+                            {
+                                "from": agent.agent_id,
+                                "to": chosen,
+                                "channel": "latent",
+                                "semantics": "read_only_latent_context",
+                            }
+                        )
+                        self.logger.info(
+                            f"[graph-latent] {agent.agent_id} consulted {chosen} (latent)."
+                        )
+                    else:
+                        _, ids, mask, _ = model.prepare_chat_batch([messages])
+                        kv_new, embeds = model.generate_latent_batch(
+                            ids,
+                            attention_mask=mask,
+                            latent_steps=latent_steps,
+                            past_key_values=agent_kvs[agent.agent_id],
+                            return_latent_embeds=True,
+                        )
                     agent_kvs[agent.agent_id] = kv_new  # carry forward, no clear
+                    agent_latents[agent.agent_id] = embeds  # latest, for neighbours
                     round_latent_embeds.append(embeds)
                     total_latent_steps += latent_steps
                 # Judger (hierarchical summarizer): attend each agent's latent via
@@ -1644,7 +1686,11 @@ class Engine:
                         "task_results": [{judger.agent_id: final_output}],
                         "summary": final_output,
                         "continue_simulation": not solved,
-                        "communications": [],
+                        "communications": round_comms,
+                        "communication_note": (
+                            "latent route metadata only; content is exchanged as "
+                            "latent embeddings/KV and is not text-scored."
+                        ),
                         "total_milestones": 0,
                         "agent_kpis": {},
                     }
@@ -1660,6 +1706,16 @@ class Engine:
             summary_data["communication_scores"] = self.evaluator.metrics[
                 "communication_score"
             ]
+            valid_planning = [
+                s for s in summary_data["planning_scores"] if s is not None and s >= 0
+            ]
+            summary_data["communication_note"] = (
+                "not scored: latent route metadata is logged, but the communication "
+                "score rates inter-agent text messages."
+            )
+            summary_data["coordination_score"] = (
+                sum(valid_planning) / len(valid_planning) if valid_planning else None
+            )
             # KPI/milestone attribution is N/A for latent (no per-agent text);
             # fields kept for schema parity with graph, values marked N/A.
             summary_data["agent_kpis"] = {}
@@ -1668,7 +1724,9 @@ class Engine:
                 "not scored: milestone KPI / per-agent attribution needs each "
                 "agent's text output; latent agents produce only KV."
             )
-            summary_data["token_usage"] = self._get_totoal_token_usage()
+            summary_data["token_usage"] = (
+                self._get_totoal_token_usage() + getattr(model, "token_usage", 0)
+            )
             # Per-environment task score (same dispatch as graph_coordinate).
             try:
                 env_name = self.environment.name
@@ -1833,6 +1891,23 @@ class Engine:
         """
         # Assuming each communication is a string or can be converted to string
         return "\n".join(str(c) for c in communications)
+
+    def _graph_neighbors(self, agent_id: str) -> List[str]:
+        """
+        Return graph neighbours for an agent using the same undirected-link
+        semantics as AgentGraph.get_agent_profiles_linked.
+        """
+        linked = set()
+        for source, target, _ in getattr(self.graph, "relationships", []):
+            if source == agent_id:
+                linked.add(target)
+            elif target == agent_id:
+                linked.add(source)
+        return [
+            agent.agent_id
+            for agent in self.graph.get_all_agents()
+            if agent.agent_id in linked
+        ]
 
     def _get_agent_profiles(self) -> str:
         """
