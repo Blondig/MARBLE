@@ -1481,14 +1481,15 @@ class Engine:
             cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         )
 
+        # Same top-level schema as graph_coordinate (iterations + the standard
+        # metric fields), plus latent-only extras appended at the end.
         summary_data: Dict[str, Any] = {
             "task": self.task,
             "coordination_mode": self.coordinate_mode,
             "communication_mode": "latent_mas",
             "model_name": model_name,
             "latent_steps": latent_steps,
-            "rounds": [],
-            "final_output": "",
+            "iterations": [],
         }
         try:
             model = ModelWrapper(
@@ -1501,6 +1502,10 @@ class Engine:
             # Last agent is the judger/summarizer; the rest are workers.
             workers = agents[:-1] if len(agents) > 1 else agents
             judger = agents[-1]
+            agent_profiles = self._get_agent_profiles()
+            agent_tasks_str = self._format_agent_tasks(
+                {agent.agent_id: self.task for agent in agents}
+            )
 
             past_kv: Optional[Any] = None
             total_latent_steps = 0
@@ -1538,18 +1543,79 @@ class Engine:
                     past_key_values=past_kv if latent_steps > 0 else None,
                 )
                 final_output = gens[0].strip()
-                summary_data["rounds"].append({"round": rnd + 1, "summary": final_output})
-                self.logger.info(f"[graph-latent] round {rnd + 1} judger decoded answer.")
+
+                # Scoring, mirroring graph_coordinate (identical metric fields).
+                # Latent agents exchange no text -> communication is -1 (as graph).
+                self.evaluator.metrics["communication_score"].append(-1)
+                try:
+                    self.evaluator.evaluate_planning(
+                        final_output, agent_profiles, agent_tasks_str, final_output
+                    )
+                    self.evaluator.evaluate_kpi(self.task, final_output)
+                except Exception:
+                    self.logger.exception("graph-latent planning/KPI evaluation failed.")
+                    self.evaluator.metrics["planning_score"].append(-1)
+
                 # Stop decision: decoded true/false (replaces decide_next_step).
-                if model.decode_bool(
+                solved = model.decode_bool(
                     past_kv,
                     "Considering the task and the latest answer, is the task fully "
                     f"and correctly solved?\nTask: {self.task[:800]}\n"
                     f"Latest answer: {final_output[:800]}",
-                ):
-                    self.logger.info(f"[graph-latent] stop signal at round {rnd + 1}.")
+                )
+                summary_data["iterations"].append(
+                    {
+                        "iteration": rnd + 1,
+                        "task_assignments": {a.agent_id: self.task for a in agents},
+                        "task_results": [{judger.agent_id: final_output}],
+                        "summary": final_output,
+                        "continue_simulation": not solved,
+                        "communications": [],
+                        "total_milestones": 0,
+                        "agent_kpis": {},
+                    }
+                )
+                self.logger.info(
+                    f"[graph-latent] round {rnd + 1} done (solved={solved})."
+                )
+                if solved:
                     break
 
+            # Top-level metrics: identical fields to graph_coordinate.
+            summary_data["planning_scores"] = self.evaluator.metrics["planning_score"]
+            summary_data["communication_scores"] = self.evaluator.metrics[
+                "communication_score"
+            ]
+            summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
+            summary_data["total_milestones"] = self.evaluator.metrics["total_milestones"]
+            summary_data["token_usage"] = self._get_totoal_token_usage()
+            # Per-environment task score (same dispatch as graph_coordinate).
+            try:
+                env_name = self.environment.name
+                if env_name == "Research Environment":
+                    self.evaluator.evaluate_task_research(self.task, final_output)
+                    summary_data["task_evaluation"] = self.evaluator.metrics[
+                        "task_evaluation"
+                    ]
+                elif env_name == "World Simulation Environment":
+                    self.evaluator.evaluate_task_world(self.task, final_output)
+                    summary_data["task_evaluation"] = self.evaluator.metrics[
+                        "task_evaluation"
+                    ]
+                elif env_name == "DB Environment":
+                    self.evaluator.evaluate_task_db(
+                        self.task,
+                        final_output,
+                        self.config.task["labels"],
+                        self.config.task["number_of_labels_pred"],
+                        self.config.task["root_causes"],
+                    )
+                    summary_data["task_evaluation"] = self.evaluator.metrics[
+                        "task_evaluation"
+                    ]
+            except Exception:
+                self.logger.exception("graph-latent task evaluation failed.")
+            # Latent-only extras (added on top of the standard fields).
             summary_data["final_output"] = final_output
             summary_data["total_latent_steps"] = total_latent_steps
             summary_data["decoded_tokens"] = (
@@ -1558,7 +1624,6 @@ class Engine:
             # Code-generation task: persist the judger-decoded solution.
             if self.environment.name == "Coding Environment":
                 self._write_latent_solution(final_output)
-            self._evaluate_latent(summary_data, final_output, agents)
         except Exception:
             self.logger.exception("An error occurred during graph-latent coordination.")
             raise
