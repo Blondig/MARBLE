@@ -1445,6 +1445,149 @@ class Engine:
             {"role": "user", "content": user},
         ]
 
+    def graph_latent_coordinate(self) -> None:
+        """
+        Graph-style latent coordination (B1, no env tools).
+
+        Reuses LatentMAS sequential KV threading (NOT a merge): per round, one KV
+        cache is threaded through every worker agent (latent reasoning), then the
+        judger agent decodes the round's answer from the accumulated KV -- this
+        replaces MARBLE's text summarize_output. A decoded true/false
+        (ModelWrapper.decode_bool) replaces decide_next_step as the stop signal.
+        No agent<->tool channel: the judger decodes the answer directly, so this
+        fits tool-free or code-generation tasks (the judger writes the code);
+        external-info tools (db/research/minecraft) need the future B2 path.
+        """
+        import torch
+
+        from marble.llms.latent_mas_model import (
+            ModelWrapper,
+            _past_length,
+            truncate_past,
+        )
+
+        cfg = self.config.latent or {}
+        model_name = cfg.get("model_name", "Qwen/Qwen2.5-7B-Instruct")
+        latent_steps = int(cfg.get("latent_steps", 10))
+        max_new_tokens = int(cfg.get("max_new_tokens", 512))
+        temperature = float(cfg.get("temperature", 0.7))
+        top_p = float(cfg.get("top_p", 0.95))
+        latent_space_realign = bool(cfg.get("latent_space_realign", False))
+        latent_only = bool(cfg.get("latent_only", False))
+        sequential_info_only = (
+            bool(cfg.get("sequential_info_only", False)) or latent_only
+        )
+        device = torch.device(
+            cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        summary_data: Dict[str, Any] = {
+            "task": self.task,
+            "coordination_mode": self.coordinate_mode,
+            "communication_mode": "latent_mas",
+            "model_name": model_name,
+            "latent_steps": latent_steps,
+            "rounds": [],
+            "final_output": "",
+        }
+        try:
+            model = ModelWrapper(
+                model_name, device, latent_space_realign=latent_space_realign
+            )
+            agents = self.graph.get_all_agents()
+            if not agents:
+                self.logger.error("No agents found for graph-latent coordination.")
+                return
+            # Last agent is the judger/summarizer; the rest are workers.
+            workers = agents[:-1] if len(agents) > 1 else agents
+            judger = agents[-1]
+
+            past_kv: Optional[Any] = None
+            total_latent_steps = 0
+            final_output = ""
+            for rnd in range(max(1, self.max_iterations)):
+                # Workers: thread ONE KV through them (latent reasoning).
+                for agent in workers:
+                    messages = self._build_latent_messages(
+                        agent, has_context=past_kv is not None, is_judger=False
+                    )
+                    _, ids, mask, _ = model.prepare_chat_batch([messages])
+                    prev_len = _past_length(past_kv)
+                    past_kv = model.generate_latent_batch(
+                        ids,
+                        attention_mask=mask,
+                        latent_steps=latent_steps,
+                        past_key_values=past_kv,
+                    )
+                    if sequential_info_only:
+                        added = _past_length(past_kv) - prev_len
+                        keep = latent_steps if latent_only else added
+                        past_kv = truncate_past(past_kv, keep)
+                    total_latent_steps += latent_steps
+                # Judger: decode this round's answer from the accumulated KV.
+                jmsg = self._build_latent_messages(
+                    judger, has_context=past_kv is not None, is_judger=True
+                )
+                _, jids, jmask, _ = model.prepare_chat_batch([jmsg])
+                gens, _ = model.generate_text_batch(
+                    jids,
+                    jmask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    past_key_values=past_kv if latent_steps > 0 else None,
+                )
+                final_output = gens[0].strip()
+                summary_data["rounds"].append({"round": rnd + 1, "summary": final_output})
+                self.logger.info(f"[graph-latent] round {rnd + 1} judger decoded answer.")
+                # Stop decision: decoded true/false (replaces decide_next_step).
+                if model.decode_bool(
+                    past_kv,
+                    "Considering the task and the latest answer, is the task fully "
+                    f"and correctly solved?\nTask: {self.task[:800]}\n"
+                    f"Latest answer: {final_output[:800]}",
+                ):
+                    self.logger.info(f"[graph-latent] stop signal at round {rnd + 1}.")
+                    break
+
+            summary_data["final_output"] = final_output
+            summary_data["total_latent_steps"] = total_latent_steps
+            summary_data["decoded_tokens"] = (
+                int(model.tokenize_text(final_output).shape[-1]) if final_output else 0
+            )
+            # Code-generation task: persist the judger-decoded solution.
+            if self.environment.name == "Coding Environment":
+                self._write_latent_solution(final_output)
+            self._evaluate_latent(summary_data, final_output, agents)
+        except Exception:
+            self.logger.exception("An error occurred during graph-latent coordination.")
+            raise
+        finally:
+            self.evaluator.finalize()
+            self._write_to_jsonl(summary_data)
+            self.logger.info("Graph-latent coordination simulation completed.")
+
+    def _write_latent_solution(self, final_output: str) -> None:
+        """
+        Extract a python code block from the judger output and write it to the
+        coding workspace as solution.py (the artifact the coder tool would have
+        produced in the text baseline).
+        """
+        import os
+        import re
+
+        match = re.search(r"```python(.*?)```", final_output, re.DOTALL)
+        code = match.group(1).strip() if match else final_output.strip()
+        workspace = getattr(self.environment, "workspace_dir", "workspace")
+        os.makedirs(workspace, exist_ok=True)
+        path = os.path.join(workspace, "solution.py")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(code)
+            self.logger.info(f"[graph-latent] wrote solution to {path}")
+        except IOError as e:
+            self.logger.error(f"Failed to write latent solution: {e}")
+
     def start(self) -> None:
         """
         Start the engine to run the simulation.
@@ -1461,6 +1604,9 @@ class Engine:
         elif self.coordinate_mode == "fixed_chain":
             self.logger.info("Running in fixed-chain (text baseline) coordination mode.")
             self.fixed_chain_coordinate()
+        elif self.coordinate_mode == "graph_latent":
+            self.logger.info("Running in graph-latent coordination mode.")
+            self.graph_latent_coordinate()
         elif self.coordinate_mode == "graph":
             self.logger.info("Running in graph-based coordination mode.")
             self.graph_coordinate()

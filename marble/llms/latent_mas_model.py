@@ -383,3 +383,135 @@ class ModelWrapper:
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
         return past
+
+    # ------------------------------------------------------------------ #
+    # Latent-MAS additions (graph-latent building blocks).
+    # Principle: CONTENT travels as KV; CONTROL decisions are a tiny decoded
+    # true/false. These are NOT in upstream LatentMAS (fixed pipeline); they are
+    # what graph-latent (dynamic rounds + agent-agent dialogue) needs.
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _as_legacy(past: Optional[object]) -> Optional[Tuple]:
+        """Normalize a KV cache (Cache or legacy tuple) to a legacy tuple."""
+        if past is None:
+            return None
+        if hasattr(past, "to_legacy_cache"):
+            return past.to_legacy_cache()  # type: ignore[no-any-return]
+        return past  # type: ignore[return-value]
+
+    def merge_kv(self, kv_list: List[Optional[Tuple]]) -> Optional[Tuple]:
+        """
+        Concatenate several KV caches along the sequence dimension (multi-source
+        fan-in for graph rounds: pool all agents' latent working memory).
+
+        NOTE (known approximation): the 2nd+ source keeps the RoPE positions it
+        was computed at, i.e. positions are not re-based after concatenation.
+        Acceptable for training-free latent collaboration; documented honestly.
+        """
+        caches = [self._as_legacy(kv) for kv in kv_list if kv is not None]
+        if not caches:
+            return None
+        if len(caches) == 1:
+            return caches[0]
+        n_layers = len(caches[0])
+        merged: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in range(n_layers):
+            keys = torch.cat([kv[layer][0] for kv in caches], dim=2)
+            vals = torch.cat([kv[layer][1] for kv in caches], dim=2)
+            merged.append((keys, vals))
+        return tuple(merged)
+
+    @torch.no_grad()
+    def decode_bool(
+        self,
+        past_key_values: Optional[Tuple],
+        question: str,
+        *,
+        max_new_tokens: int = 6,
+    ) -> bool:
+        """
+        Decode a short plaintext true/false CONTROL signal conditioned on a KV
+        working memory, without decoding full content (greedy, a few tokens).
+
+        Used for control decisions (e.g. "should this dialogue stop?", "is the
+        task complete?"). Operates on a legacy-tuple view so the caller's KV is
+        not mutated by the generate() append.
+        """
+        kv = self._as_legacy(past_key_values)
+        msgs = [
+            {
+                "role": "user",
+                "content": f"{question} Reply with only 'true' or 'false'.",
+            }
+        ]
+        prompt = self.render_chat(msgs, add_generation_prompt=True)
+        enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+        cache_position = None
+        if kv is not None:
+            past_len = _past_length(kv)
+            cache_position = torch.arange(
+                past_len,
+                past_len + input_ids.shape[-1],
+                dtype=torch.long,
+                device=self.device,
+            )
+            if past_len > 0:
+                past_mask = torch.ones(
+                    (1, past_len), dtype=attention_mask.dtype, device=self.device
+                )
+                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
+        out = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+            past_key_values=kv,
+            cache_position=cache_position,
+        )
+        gen = out[0, input_ids.shape[-1] :]
+        ans = self.tokenizer.decode(gen, skip_special_tokens=True).strip().lower()
+        return ans.startswith("true") or ans.startswith("yes")
+
+    @torch.no_grad()
+    def latent_dialogue(
+        self,
+        initiator_msgs: List[Dict],
+        responder_msgs: List[Dict],
+        *,
+        latent_steps: int,
+        max_turns: int = 5,
+        past_key_values: Optional[Tuple] = None,
+    ) -> Tuple:
+        """
+        Latent side-dialogue between two agents (Part A).
+
+        Mirrors the structure of BaseAgent._handle_new_communication_session
+        (<=max_turns, alternating speakers, early stop), but: content travels as
+        KV (no text decoded between agents), and the stop condition is a tiny
+        decoded true/false (decode_bool) instead of the text "<end-of-session>".
+        Returns the accumulated KV (the dialogue's latent outcome); no text
+        summary is produced -- the KV itself is the takeaway.
+        """
+        kv = self._as_legacy(past_key_values)
+        # Responder speaks first, mirroring the original (target agent answers).
+        roles = [responder_msgs, initiator_msgs]
+        for t in range(max_turns):
+            msgs = roles[t % 2]
+            _, input_ids, attention_mask, _ = self.prepare_chat_batch([msgs])
+            kv = self._as_legacy(
+                self.generate_latent_batch(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    latent_steps=latent_steps,
+                    past_key_values=kv,
+                )
+            )
+            if self.decode_bool(
+                kv,
+                "Based on the exchange so far, do you have enough to conclude the discussion?",
+            ):
+                break
+        return kv

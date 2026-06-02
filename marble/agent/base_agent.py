@@ -287,7 +287,8 @@ class BaseAgent:
             )
             self.logger.info(f"Agent '{self.agent_id}' acted with result '{result}'.")
         result_content = result.content if result.content else ""
-        self.token_usage += self._calculate_token_usage(task, result_content)
+        # Note: the act() LLM call is already counted via token_counter above;
+        # do NOT add _calculate_token_usage here too (it double-counts the call).
         output = "Result from the model:" + result_content + "\n"
         if result_from_function_str:
             output += "Result from the function:" + result_from_function_str

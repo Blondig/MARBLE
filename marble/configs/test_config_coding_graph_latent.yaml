@@ -1,0 +1,62 @@
+# Graph-latent (B1) smoke test on a small coding task.
+# Agents reason in latent (KV threaded through workers), the judger decodes the
+# final code, which is written to workspace/solution.py. No coder/reviewer tools
+# (the judger generates the code directly) -- the LatentMAS-faithful way to do code.
+#
+# Run (vLLM:9999 up for the judge; transformers loads the local model for agents):
+#   export OPENAI_API_BASE=http://localhost:9999/v1 OPENAI_API_KEY=EMPTY
+#   mkdir -p result workspace
+#   python -m marble.main --config_path marble/configs/test_config_coding_graph_latent.yaml
+coordinate_mode: graph_latent
+
+llm: "openai/Qwen3-8B"
+
+relationships:
+  - [agent1, agent2, "collaborates_with"]
+  - [agent2, agent3, "collaborates_with"]
+
+environment:
+  type: Coding
+  name: "Coding Environment"
+  workspace_dir: "workspace"
+  max_iterations: 3
+
+task:
+  content: |-
+    Write a self-contained Python function `fib(n)` that returns the nth Fibonacci
+    number (0-indexed: fib(0)=0, fib(1)=1). It must handle n up to 50 efficiently.
+    Put the final code in a ```python code block.
+  output_format: "Output only the final Python solution inside a ```python code block."
+
+agents:
+  - type: BaseAgent
+    agent_id: agent1
+    profile: "A planner that outlines a concise approach to the coding task."
+  - type: BaseAgent
+    agent_id: agent2
+    profile: "A coder that works out the implementation details."
+  - type: BaseAgent
+    agent_id: agent3
+    profile: "A reviewer that produces the final, correct Python solution."
+
+memory:
+  type: SharedMemory
+
+metrics:
+  evaluate_llm:
+    model: "openai/Qwen3-8B"
+
+latent:
+  model_name: "/data0/xyao/models/Qwen3-8B"
+  latent_steps: 10
+  latent_space_realign: true
+  max_new_tokens: 1024
+  temperature: 0.7
+  top_p: 0.95
+  device: "cuda"
+
+engine_planner:
+  initial_progress: "Starting graph-latent coding."
+
+output:
+  file_path: "result/coding_graph_latent_output.jsonl"
