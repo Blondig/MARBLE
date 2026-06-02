@@ -58,6 +58,29 @@ def main() -> None:
     if isinstance(config.metrics, dict):
         config.metrics["evaluate_llm"] = {"model": LOCAL_MODEL}
 
+    # Optional: run ANY config in graph-latent mode without editing it.
+    # GRAPH_LATENT=1 flips coordinate_mode and injects a latent block, so the
+    # existing graph configs (e.g. coding_configs/config_N.yaml) can be run latent
+    # for an apples-to-apples comparison. Tunable via env: LATENT_MODEL /
+    # LATENT_STEPS / LATENT_MAX_NEW_TOKENS / LATENT_DEVICE / LATENT_OUTPUT.
+    if os.environ.get("GRAPH_LATENT") == "1":
+        config.coordination_mode = "graph_latent"
+        latent = config.latent if isinstance(config.latent, dict) else {}
+        latent.setdefault(
+            "model_name", os.environ.get("LATENT_MODEL", "/data0/xyao/models/Qwen3-8B")
+        )
+        latent.setdefault("latent_steps", int(os.environ.get("LATENT_STEPS", "10")))
+        latent.setdefault("latent_space_realign", True)
+        latent.setdefault(
+            "max_new_tokens", int(os.environ.get("LATENT_MAX_NEW_TOKENS", "2048"))
+        )
+        latent.setdefault("device", os.environ.get("LATENT_DEVICE", "cuda"))
+        config.latent = latent
+        if isinstance(config.output, dict):
+            config.output["file_path"] = os.environ.get(
+                "LATENT_OUTPUT", "result/coding_graph_latent_output.jsonl"
+            )
+
     # Initialize and start the engine
     try:
         logging.info(f"Starting engine with configuration: {args.config_path}")

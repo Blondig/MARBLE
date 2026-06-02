@@ -1447,16 +1447,29 @@ class Engine:
 
     def graph_latent_coordinate(self) -> None:
         """
-        Graph-style latent coordination (B1, no env tools).
+        Graph-latent coordination (B1 approximation).
 
-        Reuses LatentMAS sequential KV threading (NOT a merge): per round, one KV
-        cache is threaded through every worker agent (latent reasoning), then the
-        judger agent decodes the round's answer from the accumulated KV -- this
-        replaces MARBLE's text summarize_output. A decoded true/false
-        (ModelWrapper.decode_bool) replaces decide_next_step as the stop signal.
-        No agent<->tool channel: the judger decodes the answer directly, so this
-        fits tool-free or code-generation tasks (the judger writes the code);
-        external-info tools (db/research/minecraft) need the future B2 path.
+        IMPORTANT -- this is NOT a literal latent replica of graph_coordinate.
+        It is a LatentMAS-hierarchical analogue with a MARBLE-style round loop:
+        per round one KV cache is threaded sequentially through the worker agents
+        (LatentMAS run_batch threading, NOT a merge), then the judger decodes the
+        round answer from the accumulated KV (replaces summarize_output), and a
+        decoded true/false (decode_bool) replaces decide_next_step.
+
+        Known divergences from graph_coordinate (inherent to latent or by design):
+        - Inherent: latent agents emit only KV, no per-agent text results, so the
+          "all agents act -> per-agent text results -> planner aggregation" of
+          graph cannot be reproduced; planning uses the judger's decoded answer,
+          and KPI/communication are N/A (see below). Relationships/edges are not
+          used (graph uses them only for new_communication_session anyway).
+        - By design: no agent<->tool channel (judger decodes the answer/code
+          directly); stop is decode_bool, not the text decide_next_step. Tool-
+          using benchmarks (db/research/minecraft) need the future B2 path.
+
+        Output schema matches graph_coordinate (iterations/planning_scores/
+        communication_scores/agent_kpis/total_milestones/token_usage/
+        task_evaluation) for comparability, with latent-only extras appended; but
+        communication is -1 (no text) and KPI is N/A, exactly as for latent.
         """
         import torch
 
@@ -1544,16 +1557,19 @@ class Engine:
                 )
                 final_output = gens[0].strip()
 
-                # Scoring, mirroring graph_coordinate (identical metric fields).
-                # Latent agents exchange no text -> communication is -1 (as graph).
+                # Scoring, mirroring graph_coordinate's fields. Latent agents
+                # exchange no text -> communication is -1 (as graph). Planning is
+                # a holistic judge of the round's decoded answer. KPI is NOT
+                # computed: milestone attribution needs each agent's text output,
+                # which latent agents do not produce (consistent with
+                # _evaluate_latent); agent_kpis/total_milestones stay N/A below.
                 self.evaluator.metrics["communication_score"].append(-1)
                 try:
                     self.evaluator.evaluate_planning(
                         final_output, agent_profiles, agent_tasks_str, final_output
                     )
-                    self.evaluator.evaluate_kpi(self.task, final_output)
                 except Exception:
-                    self.logger.exception("graph-latent planning/KPI evaluation failed.")
+                    self.logger.exception("graph-latent planning evaluation failed.")
                     self.evaluator.metrics["planning_score"].append(-1)
 
                 # Stop decision: decoded true/false (replaces decide_next_step).
@@ -1586,8 +1602,14 @@ class Engine:
             summary_data["communication_scores"] = self.evaluator.metrics[
                 "communication_score"
             ]
-            summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
-            summary_data["total_milestones"] = self.evaluator.metrics["total_milestones"]
+            # KPI/milestone attribution is N/A for latent (no per-agent text);
+            # fields kept for schema parity with graph, values marked N/A.
+            summary_data["agent_kpis"] = {}
+            summary_data["total_milestones"] = None
+            summary_data["kpi_note"] = (
+                "not scored: milestone KPI / per-agent attribution needs each "
+                "agent's text output; latent agents produce only KV."
+            )
             summary_data["token_usage"] = self._get_totoal_token_usage()
             # Per-environment task score (same dispatch as graph_coordinate).
             try:

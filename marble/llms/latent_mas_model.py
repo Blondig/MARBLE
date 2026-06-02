@@ -399,28 +399,6 @@ class ModelWrapper:
             return past.to_legacy_cache()  # type: ignore[no-any-return]
         return past  # type: ignore[return-value]
 
-    def merge_kv(self, kv_list: List[Optional[Tuple]]) -> Optional[Tuple]:
-        """
-        Concatenate several KV caches along the sequence dimension (multi-source
-        fan-in for graph rounds: pool all agents' latent working memory).
-
-        NOTE (known approximation): the 2nd+ source keeps the RoPE positions it
-        was computed at, i.e. positions are not re-based after concatenation.
-        Acceptable for training-free latent collaboration; documented honestly.
-        """
-        caches = [self._as_legacy(kv) for kv in kv_list if kv is not None]
-        if not caches:
-            return None
-        if len(caches) == 1:
-            return caches[0]
-        n_layers = len(caches[0])
-        merged: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        for layer in range(n_layers):
-            keys = torch.cat([kv[layer][0] for kv in caches], dim=2)
-            vals = torch.cat([kv[layer][1] for kv in caches], dim=2)
-            merged.append((keys, vals))
-        return tuple(merged)
-
     @torch.no_grad()
     def decode_bool(
         self,
