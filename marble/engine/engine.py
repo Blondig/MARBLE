@@ -1285,14 +1285,15 @@ class Engine:
         ]
 
     def _build_graph_latent_worker_msg(
-        self, agent: BaseAgent, first_round: bool, prior_summary: str
+        self, agent: BaseAgent, first_round: bool
     ) -> List[Dict[str, str]]:
         """One worker (graph node) message for graph_latent_coordinate.
 
         Round 1 encodes the FULL task (it then lives in the agent's own KV).
-        Round >= 2 feeds only a short "continue" instruction + the latest team
-        summary -- the task is NOT restated, so the carried KV grows by a small
-        delta instead of re-pasting the task (the cause of the KV blow-up).
+        Round >= 2 feeds only a short "continue" instruction -- the task and all
+        prior reasoning (its own + any latent pushed in by neighbours) are already
+        in the carried KV. The planner's summary is NOT injected, mirroring graph,
+        where an agent re-plans from its own memory, not the planner's output.
         """
         profile = agent.get_profile()
         if first_round:
@@ -1305,29 +1306,28 @@ class Engine:
         else:
             user = (
                 f"You are {agent.agent_id}: {profile}\n"
-                "Continue and improve your reasoning for the same task (it is "
-                "already in your working memory -- do NOT restate it).\n"
-                f"Latest team summary:\n{prior_summary}\n"
+                "Continue and improve your reasoning for the same task. Everything "
+                "you and your teammates have contributed is already in your working "
+                "memory (KV) -- build on it; do NOT restate the task."
             )
         return [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": user},
         ]
 
-    def _build_graph_latent_judger_msg(
-        self, judger: BaseAgent
-    ) -> List[Dict[str, str]]:
-        """The judger/summarizer message for graph_latent_coordinate.
+    def _build_graph_latent_summarizer_msg(self) -> List[Dict[str, str]]:
+        """White-box BRIDGE prompt for graph_latent_coordinate.
 
-        The other agents' latent thoughts are inserted as input embeddings by
-        ModelWrapper.generate_text_from_embeds (hierarchical aggregation), so the
-        prompt itself only carries the task once and the output-format request.
+        The agents' latent reasoning is inserted as input embeddings by
+        ModelWrapper.generate_text_from_embeds; this decodes it into a text round
+        answer -- i.e. the agents->planner communication channel in latent form.
+        The decoded text then feeds the real EnginePlanner (summarize_output /
+        decide_next_step), exactly as graph_coordinate feeds it the text results.
         """
-        profile = judger.get_profile()
         user = (
-            f"You are {judger.agent_id}, the team summarizer: {profile}\n"
+            "You are the team coordinator. You are given the agents' latent "
+            "reasoning as working memory.\n"
             f"Task: {self.task}\n"
-            "You are given the other agents' latent reasoning as working memory. "
             "Use it as reference (ignore irrelevant parts) and produce the final "
             "answer to the task.\n"
             f"Output format: {self.output_format}"
@@ -1506,23 +1506,27 @@ class Engine:
         Graph-latent coordination (v1 skeleton: per-agent KV + hierarchical
         aggregation). NOT a literal latent replica of graph_coordinate.
 
-        Structure (faithful to graph's node-independence + LatentMAS parts):
-        - Each graph node = one agent with its OWN latent working memory (kv_i),
-          carried across rounds and never cleared. Round 1 encodes the full task;
-          round >= 2 feeds only a short "continue + latest summary" instruction
-          (task already in kv_i) so the KV grows by a small delta per round.
-        - Side communication reads a neighbour's latest latent thoughts as
-          temporary input embeddings, then persists only this agent's updated
-          working memory. This keeps per-agent KV isolated while still allowing
-          latent influence across graph edges.
-        - Round aggregation = LatentMAS hierarchical: the judger/summarizer attends
-          each agent's latent "thoughts" via embedding insertion
-          (generate_text_from_embeds, RoPE fresh) and decodes the round answer.
-        - Stop = a tiny PLAINTEXT control decode (decode_bool) over the round's
-          text answer, replacing decide_next_step.
+        Structure (follows graph_coordinate; only the agents->planner channel is
+        latent):
+        - ALL config agents work (reason in latent), each with its OWN latent
+          working memory (kv_i), carried across rounds and never cleared. Round 1
+          encodes the full task; round >= 2 feeds only a short "continue + latest
+          summary" instruction so the KV grows by a small delta per round.
+        - Side (agent<->agent) = graph PUSH: an agent routes (plaintext, over its
+          relationships) and pushes its latent thoughts into a neighbour's KV
+          (RoPE-safe embed append), which the neighbour accumulates -- mirroring
+          new_communication_session.
+        - agents -> planner communication is the ONLY latent-specific aggregation:
+          a white-box bridge attends all agents' latent (embedding insertion, RoPE
+          fresh) and decodes a text round answer (replaces graph's text
+          _summarize_results).
+        - From there it REUSES the standalone EnginePlanner exactly as graph:
+          summarize_output formats the summary, evaluate_planning scores it,
+          decide_next_step decides stop, update_progress advances. The planner is
+          NOT a config agent.
 
         Deferred to a later step:
-        - agent<->tool channel for tool-using benchmarks (db/research/minecraft).
+        - multi-turn side dialogue; agent<->tool channel (db/research/minecraft).
 
         Output schema matches graph_coordinate (iterations/planning_scores/
         communication_scores/agent_kpis/total_milestones/token_usage/
@@ -1562,9 +1566,12 @@ class Engine:
             if not agents:
                 self.logger.error("No agents found for graph-latent coordination.")
                 return
-            # Last agent is the judger/summarizer; the rest are workers.
-            workers = agents[:-1] if len(agents) > 1 else agents
-            judger = agents[-1]
+            # Follow graph: ALL config agents work (reason in latent). The
+            # summarizer/decider is the standalone EnginePlanner (self.planner),
+            # NOT a config agent -- exactly as graph_coordinate. The only latent
+            # change is the agents->planner channel: instead of text results, the
+            # planner is fed a white-box bridge decode of the agents' latent.
+            workers = agents
             agent_profiles = self._get_agent_profiles()
             agent_tasks_str = self._format_agent_tasks(
                 {agent.agent_id: self.task for agent in agents}
@@ -1583,22 +1590,22 @@ class Engine:
             reasoned: set = set()
             total_latent_steps = 0
             final_output = ""
-            prior_summary = ""
+            summary_text = ""
             for rnd in range(max(1, self.max_iterations)):
                 # Each worker reasons in latent on its OWN carried KV, and exposes
-                # its latent "thoughts" (embeds) for the judger to attend.
+                # its latent "thoughts" (embeds) for the summarizer bridge to read.
                 round_latent_embeds: List[Any] = []
                 round_comms: List[Dict[str, str]] = []
                 for agent in workers:
                     aid = agent.agent_id
                     first_round = aid not in reasoned
                     messages = self._build_graph_latent_worker_msg(
-                        agent, first_round=first_round, prior_summary=prior_summary
+                        agent, first_round=first_round
                     )
                     # Reason in latent on this agent's OWN carried KV -- which may
                     # already hold latent pushed in by a neighbour over the side
                     # channel (this/last round). The new latent embeds are exposed
-                    # for the judger to attend.
+                    # for the summarizer bridge to read.
                     _, ids, mask, _ = model.prepare_chat_batch([messages])
                     kv_new, embeds = model.generate_latent_batch(
                         ids,
@@ -1621,17 +1628,16 @@ class Engine:
                     targets = [n for n in self._graph_neighbors(aid) if n in agent_kvs]
                     if targets:
                         # Route like graph's new_communication_session: the choice
-                        # is conditioned on the agent's CURRENT context (task +
-                        # latest team progress), so it varies across rounds instead
-                        # of being a static profile-only decision.
+                        # is conditioned on the agent's OWN current reasoning state
+                        # (its carried KV, read-only), not the planner's summary --
+                        # graph routes from the agent's own memory. This also makes
+                        # it vary across rounds as the KV grows.
                         tgt = model.decode_choice(
-                            f"You are {aid} ({agent.get_profile()}).\n"
-                            f"Task: {self.task[:600]}\n"
-                            f"Team progress so far: {prior_summary[:600] or '(none yet)'}\n"
-                            "Based on your role and the current progress, which "
-                            "teammate (if any) should you share your reasoning with "
-                            "to help solve the task?",
+                            f"You are {aid} ({agent.get_profile()}). Based on your "
+                            "current reasoning so far, which teammate (if any) should "
+                            "you share it with to help solve the task?",
                             targets,
+                            past_key_values=agent_kvs[aid],
                         )
                         if tgt and latent_steps > 0:
                             # The "message" is the sender's latent thoughts (the
@@ -1645,49 +1651,51 @@ class Engine:
                             self.logger.info(
                                 f"[graph-latent] {aid} pushed latent to {tgt}."
                             )
-                # Judger (hierarchical summarizer): attend each agent's latent via
-                # embedding insertion (RoPE fresh), then decode the round answer.
-                jmsg = self._build_graph_latent_judger_msg(judger)
-                jprompt = model.render_chat(jmsg, add_generation_prompt=True)
+                # Agents -> planner communication via INPUT EMBEDS (the latent
+                # channel): a white-box bridge reads ALL agents' latent (inserted as
+                # embeds, RoPE fresh) and decodes a text round answer. This is the
+                # only latent-specific step; it replaces graph's text
+                # _summarize_results. Everything below REUSES the real EnginePlanner.
+                bmsg = self._build_graph_latent_summarizer_msg()
+                bprompt = model.render_chat(bmsg, add_generation_prompt=True)
                 final_output = model.generate_text_from_embeds(
-                    jprompt,
+                    bprompt,
                     round_latent_embeds,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
                 ).strip()
-                prior_summary = final_output
 
-                # Scoring, mirroring graph_coordinate's fields. Latent agents
-                # exchange no text -> communication is -1 (as graph). Planning is
-                # a holistic judge of the round's decoded answer. KPI is NOT
-                # computed: milestone attribution needs each agent's text output,
-                # which latent agents do not produce (consistent with
-                # _evaluate_latent); agent_kpis/total_milestones stay N/A below.
+                # From here on, IDENTICAL to graph_coordinate: the standalone
+                # EnginePlanner formats the summary, planning is scored, and the
+                # planner decides whether to continue and updates its progress.
+                summary = self.planner.summarize_output(
+                    final_output, self.task, self.output_format
+                )
+                summary_text = summary.content
+
+                # communication is -1 (latent, no text to score), KPI N/A.
                 self.evaluator.metrics["communication_score"].append(-1)
                 try:
                     self.evaluator.evaluate_planning(
-                        final_output, agent_profiles, agent_tasks_str, final_output
+                        summary_text, agent_profiles, agent_tasks_str, final_output
                     )
                 except Exception:
                     self.logger.exception("graph-latent planning evaluation failed.")
                     self.evaluator.metrics["planning_score"].append(-1)
 
-                # Stop decision: a clean PLAINTEXT control decode over the round's
-                # text answer (no latent-KV pollution; replaces decide_next_step).
-                solved = model.decode_bool(
-                    None,
-                    "Considering the task and the latest answer, is the task fully "
-                    f"and correctly solved?\nTask: {self.task[:800]}\n"
-                    f"Latest answer: {final_output[:800]}",
+                continue_simulation = self.planner.decide_next_step(
+                    [{"team_latent_summary": final_output}]
                 )
+                if continue_simulation:
+                    self.planner.update_progress(summary_text)
                 summary_data["iterations"].append(
                     {
                         "iteration": rnd + 1,
                         "task_assignments": {a.agent_id: self.task for a in agents},
-                        "task_results": [{judger.agent_id: final_output}],
-                        "summary": final_output,
-                        "continue_simulation": not solved,
+                        "task_results": [{"summarizer": final_output}],
+                        "summary": summary_text,
+                        "continue_simulation": continue_simulation,
                         "communications": round_comms,
                         "communication_note": (
                             "latent route metadata only; content is exchanged as "
@@ -1698,9 +1706,9 @@ class Engine:
                     }
                 )
                 self.logger.info(
-                    f"[graph-latent] round {rnd + 1} done (solved={solved})."
+                    f"[graph-latent] round {rnd + 1} done (continue={continue_simulation})."
                 )
-                if solved:
+                if not continue_simulation:
                     break
 
             # Top-level metrics: identical fields to graph_coordinate.
@@ -1733,19 +1741,19 @@ class Engine:
             try:
                 env_name = self.environment.name
                 if env_name == "Research Environment":
-                    self.evaluator.evaluate_task_research(self.task, final_output)
+                    self.evaluator.evaluate_task_research(self.task, summary_text)
                     summary_data["task_evaluation"] = self.evaluator.metrics[
                         "task_evaluation"
                     ]
                 elif env_name == "World Simulation Environment":
-                    self.evaluator.evaluate_task_world(self.task, final_output)
+                    self.evaluator.evaluate_task_world(self.task, summary_text)
                     summary_data["task_evaluation"] = self.evaluator.metrics[
                         "task_evaluation"
                     ]
                 elif env_name == "DB Environment":
                     self.evaluator.evaluate_task_db(
                         self.task,
-                        final_output,
+                        summary_text,
                         self.config.task["labels"],
                         self.config.task["number_of_labels_pred"],
                         self.config.task["root_causes"],
@@ -1761,7 +1769,7 @@ class Engine:
             summary_data["decoded_tokens"] = (
                 int(model.tokenize_text(final_output).shape[-1]) if final_output else 0
             )
-            # Code-generation task: persist the judger-decoded solution.py only.
+            # Code-generation task: persist the bridge-decoded solution.py only.
             # Code-quality scoring is done OFFLINE in batch once all solutions
             # exist (scripts/coding/eval_coding_solutions.py), NOT inline here.
             if self.environment.name == "Coding Environment":

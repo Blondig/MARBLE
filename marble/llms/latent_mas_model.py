@@ -677,17 +677,21 @@ class ModelWrapper:
         question: str,
         options: List[str],
         *,
+        past_key_values: Optional[Tuple] = None,
         max_new_tokens: int = 12,
     ) -> Optional[str]:
         """Decode a short plaintext CONTROL choice from a fixed option set (greedy,
-        a few tokens, no KV). Returns the matched option, or None for "none"/no match.
+        a few tokens). Returns the matched option, or None for "none"/no match.
 
-        Used for graph-latent routing -- "consult which neighbour?" -- mirroring the
-        new_communication_session tool call (whether + whom) in plaintext, while the
-        exchanged CONTENT stays latent.
+        If ``past_key_values`` is given, the choice is conditioned on that KV
+        working memory (read-only, on a copied cache) -- e.g. the routing agent's
+        own latent reasoning. Used for graph-latent routing -- "consult which
+        neighbour?" -- mirroring the new_communication_session tool call
+        (whether + whom) in plaintext, while the exchanged CONTENT stays latent.
         """
         if not options:
             return None
+        kv = self._copy_cache(past_key_values)
         listed = ", ".join(list(options) + ["none"])
         msgs = [
             {
@@ -699,12 +703,28 @@ class ModelWrapper:
         enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
+        cache_position = None
+        if kv is not None:
+            past_len = _past_length(kv)
+            cache_position = torch.arange(
+                past_len,
+                past_len + input_ids.shape[-1],
+                dtype=torch.long,
+                device=self.device,
+            )
+            if past_len > 0:
+                past_mask = torch.ones(
+                    (1, past_len), dtype=attention_mask.dtype, device=self.device
+                )
+                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
         out = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=self.tokenizer.pad_token_id,
+            past_key_values=kv,
+            cache_position=cache_position,
         )
         gen = out[0, input_ids.shape[-1] :]
         self.token_usage += int(input_ids.numel() + gen.numel())
