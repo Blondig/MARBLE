@@ -137,15 +137,16 @@ class ModelWrapper:
         self,
         messages: List[Dict],
         add_generation_prompt: bool = True,
-        enable_thinking: Optional[bool] = None,
+        enable_thinking: Optional[bool] = False,
     ) -> str:
         """Render messages with the chat template.
 
-        ``enable_thinking`` is left UNSET by default, matching upstream LatentMAS
-        (the worker/judger keep the model's default reasoning behaviour -- Qwen3
-        thinking ON). Pass ``enable_thinking=False`` only for the tiny plaintext
-        CONTROL decodes (decode_bool / decode_choice), where a <think> block would
-        ruin the short true/false / choice answer.
+        ``enable_thinking`` defaults to False to MATCH MARBLE graph, whose agents
+        and EnginePlanner all go through model_prompting, which forces
+        chat_template_kwargs={"enable_thinking": False} on the vLLM Qwen path. So
+        the latent arm runs thinking-off too (fair text-vs-latent comparison, and
+        the bridge emits the answer directly instead of a budget-eating think).
+        Pass enable_thinking=None to fall back to the template default.
         """
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
