@@ -521,32 +521,27 @@ class Evaluator:
 
     def evaluate_code_quality(self, task: str, code_result: str) -> None:
         """
-        Evaluate the code quality based on stricter criteria.
+        Evaluate code quality with an LLM judge (4 criteria, 1-5 each).
+
+        Uses the ``task`` content and produced ``code_result`` passed in -- no
+        hardcoded config/solution paths -- so it works for any per-task config and
+        for offline scoring of saved solutions.
         """
         try:
-            config_path = "marble/configs/coding_config/coding_config.yaml"
-            if not os.path.exists(config_path):
-                self.logger.error("Config file not found")
-                return
-
-            yaml = YAML()
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.load(f)
-
-            full_task_description = config['task']['content']
+            full_task_description = task or ""
 
             requirements_start = "1. Implementation requirements:\n"
             requirements_end = "\n\n2. Project structure:"
-            requirements = full_task_description[
-                full_task_description.find(requirements_start) + len(requirements_start):
-                full_task_description.find(requirements_end)
-            ].strip()
+            r_start = full_task_description.find(requirements_start)
+            r_end = full_task_description.find(requirements_end)
+            if r_start != -1 and r_end != -1:
+                requirements = full_task_description[
+                    r_start + len(requirements_start) : r_end
+                ].strip()
+            else:
+                requirements = full_task_description.strip()
 
-            solution_path = "marble/workspace/solution.py"
-            solution_content = ""
-            if os.path.exists(solution_path):
-                with open(solution_path, 'r', encoding='utf-8') as f:
-                    solution_content = f.read()
+            solution_content = code_result or ""
 
             code_quality_prompt_template = """
                     [Context]

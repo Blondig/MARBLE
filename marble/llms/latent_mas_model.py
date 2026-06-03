@@ -133,24 +133,36 @@ class ModelWrapper:
         if self.latent_space_realign:
             self._ensure_latent_realign_matrix(self.model, self.device)
 
-    def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
+    def render_chat(
+        self,
+        messages: List[Dict],
+        add_generation_prompt: bool = True,
+        enable_thinking: Optional[bool] = None,
+    ) -> str:
+        """Render messages with the chat template.
+
+        ``enable_thinking`` is left UNSET by default, matching upstream LatentMAS
+        (the worker/judger keep the model's default reasoning behaviour -- Qwen3
+        thinking ON). Pass ``enable_thinking=False`` only for the tiny plaintext
+        CONTROL decodes (decode_bool / decode_choice), where a <think> block would
+        ruin the short true/false / choice answer.
+        """
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
-            try:
-                # Qwen3 et al. default to a <think> reasoning block, which eats
-                # the decode budget and breaks downstream JSON parsing. The
-                # latent reasoning already happens in KV space, so disable it.
-                return self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=add_generation_prompt,
-                    enable_thinking=False,
-                )
-            except TypeError:
-                # Template does not accept enable_thinking (non-Qwen3 models).
-                return self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=add_generation_prompt
-                )
+            if enable_thinking is not None:
+                try:
+                    return self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=add_generation_prompt,
+                        enable_thinking=enable_thinking,
+                    )
+                except TypeError:
+                    # Template does not accept enable_thinking (non-Qwen3 models).
+                    pass
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt
+            )
         segments = []
         for message in messages:
             role = message.get("role", "user")
@@ -425,6 +437,12 @@ class ModelWrapper:
         past = outputs.past_key_values
 
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
+        # Upstream generate_latent_batch_hidden_state harvests the prompt's INPUT
+        # embeddings (hidden_states[0]) followed by the latent vectors, so a
+        # hierarchical reader sees the latents grounded by normal token embeds.
+        prompt_embeds_harvest = (
+            outputs.hidden_states[0] if return_latent_embeds else None
+        )
 
         latent_vecs: List[torch.Tensor] = []
         for step in range(latent_steps):
@@ -452,10 +470,8 @@ class ModelWrapper:
 
         self.token_usage += int(batch * (seq_len + latent_steps))
         if return_latent_embeds:
-            if latent_vecs:
-                embeds = torch.cat(latent_vecs, dim=1)
-            else:
-                embeds = last_hidden.new_zeros((batch, 0, last_hidden.shape[-1]))
+            # [prompt input-embeds ++ latent vecs], matching upstream.
+            embeds = torch.cat([prompt_embeds_harvest] + latent_vecs, dim=1)
             return past, embeds
         return past
 
@@ -623,7 +639,7 @@ class ModelWrapper:
                 "content": f"{question} Reply with only 'true' or 'false'.",
             }
         ]
-        prompt = self.render_chat(msgs, add_generation_prompt=True)
+        prompt = self.render_chat(msgs, add_generation_prompt=True, enable_thinking=False)
         enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
@@ -679,7 +695,7 @@ class ModelWrapper:
                 "content": f"{question}\nReply with exactly one of: {listed}.",
             }
         ]
-        prompt = self.render_chat(msgs, add_generation_prompt=True)
+        prompt = self.render_chat(msgs, add_generation_prompt=True, enable_thinking=False)
         enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
