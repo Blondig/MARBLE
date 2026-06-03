@@ -1620,10 +1620,17 @@ class Engine:
                     # teammate has produced latent -- what flows is the sender's own.
                     targets = [n for n in self._graph_neighbors(aid) if n in agent_kvs]
                     if targets:
+                        # Route like graph's new_communication_session: the choice
+                        # is conditioned on the agent's CURRENT context (task +
+                        # latest team progress), so it varies across rounds instead
+                        # of being a static profile-only decision.
                         tgt = model.decode_choice(
-                            f"You are {aid} ({agent.get_profile()}). Send your current "
-                            "reasoning to a teammate to help them solve the task? "
-                            "Pick who (or none).",
+                            f"You are {aid} ({agent.get_profile()}).\n"
+                            f"Task: {self.task[:600]}\n"
+                            f"Team progress so far: {prior_summary[:600] or '(none yet)'}\n"
+                            "Based on your role and the current progress, which "
+                            "teammate (if any) should you share your reasoning with "
+                            "to help solve the task?",
                             targets,
                         )
                         if tgt and latent_steps > 0:
