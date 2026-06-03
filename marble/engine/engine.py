@@ -1576,10 +1576,11 @@ class Engine:
             # task already lives in kv_i), so each KV grows by a small delta per
             # round instead of re-pasting the task.
             agent_kvs: Dict[str, Any] = {a.agent_id: None for a in workers}
-            # Latest latent "thoughts" each agent has produced; neighbours read
-            # these as temporary side context, and the judger reads them via
-            # embedding insertion for hierarchical aggregation.
-            agent_latents: Dict[str, Any] = {}
+            # Agents that have reasoned at least once. A KV can become non-None
+            # before its owner reasons (a neighbour pushed latent into it over the
+            # side channel), so "first round / encode the full task" is tracked by
+            # reasoning, not by KV being None.
+            reasoned: set = set()
             total_latent_steps = 0
             final_output = ""
             prior_summary = ""
@@ -1589,60 +1590,50 @@ class Engine:
                 round_latent_embeds: List[Any] = []
                 round_comms: List[Dict[str, str]] = []
                 for agent in workers:
-                    first_round = agent_kvs[agent.agent_id] is None
+                    aid = agent.agent_id
+                    first_round = aid not in reasoned
                     messages = self._build_graph_latent_worker_msg(
                         agent, first_round=first_round, prior_summary=prior_summary
                     )
-                    prompt = model.render_chat(messages, add_generation_prompt=True)
-
-                    # Part A (side): edge-gated + plaintext-routed latent side context.
-                    # Candidates = graph neighbours whose latent is already available.
-                    candidates = [
-                        n
-                        for n in self._graph_neighbors(agent.agent_id)
-                        if agent_latents.get(n) is not None
-                    ]
-                    chosen = None
-                    if candidates:
-                        chosen = model.decode_choice(
-                            f"You are {agent.agent_id} ({agent.get_profile()}). To "
-                            "help solve the task, whose latent reasoning would you "
-                            "consult?",
-                            candidates,
-                        )
-                    if chosen:
-                        # Read the neighbour's latest latent side context without
-                        # copying the neighbour's KV into this agent's carried KV.
-                        kv_new, embeds = model.generate_latent_with_context(
-                            prompt,
-                            agent_kvs[agent.agent_id],
-                            latent_steps=latent_steps,
-                            neighbor_latents=[agent_latents[chosen]],
-                        )
-                        round_comms.append(
-                            {
-                                "from": agent.agent_id,
-                                "to": chosen,
-                                "channel": "latent",
-                                "semantics": "read_only_latent_context",
-                            }
-                        )
-                        self.logger.info(
-                            f"[graph-latent] {agent.agent_id} consulted {chosen} (latent)."
-                        )
-                    else:
-                        _, ids, mask, _ = model.prepare_chat_batch([messages])
-                        kv_new, embeds = model.generate_latent_batch(
-                            ids,
-                            attention_mask=mask,
-                            latent_steps=latent_steps,
-                            past_key_values=agent_kvs[agent.agent_id],
-                            return_latent_embeds=True,
-                        )
-                    agent_kvs[agent.agent_id] = kv_new  # carry forward, no clear
-                    agent_latents[agent.agent_id] = embeds  # latest, for neighbours
+                    # Reason in latent on this agent's OWN carried KV -- which may
+                    # already hold latent pushed in by a neighbour over the side
+                    # channel (this/last round). The new latent embeds are exposed
+                    # for the judger to attend.
+                    _, ids, mask, _ = model.prepare_chat_batch([messages])
+                    kv_new, embeds = model.generate_latent_batch(
+                        ids,
+                        attention_mask=mask,
+                        latent_steps=latent_steps,
+                        past_key_values=agent_kvs[aid],
+                        return_latent_embeds=True,
+                    )
+                    agent_kvs[aid] = kv_new  # carry forward, no clear
                     round_latent_embeds.append(embeds)
+                    reasoned.add(aid)
                     total_latent_steps += latent_steps
+
+                    # Part A (side): graph PUSH. Like new_communication_session, the
+                    # agent decides (plaintext route over its graph neighbours)
+                    # whether to send THIS round's latent to a teammate; the teammate
+                    # ACCUMULATES it into its own KV (RoPE-safe embed append, never a
+                    # raw-KV concat). Candidates are NOT filtered by whether the
+                    # teammate has produced latent -- what flows is the sender's own.
+                    targets = [n for n in self._graph_neighbors(aid) if n in agent_kvs]
+                    if targets:
+                        tgt = model.decode_choice(
+                            f"You are {aid} ({agent.get_profile()}). Send your current "
+                            "reasoning to a teammate to help them solve the task? "
+                            "Pick who (or none).",
+                            targets,
+                        )
+                        if tgt:
+                            agent_kvs[tgt] = model.absorb_embeds(agent_kvs[tgt], embeds)
+                            round_comms.append(
+                                {"from": aid, "to": tgt, "channel": "latent"}
+                            )
+                            self.logger.info(
+                                f"[graph-latent] {aid} pushed latent to {tgt}."
+                            )
                 # Judger (hierarchical summarizer): attend each agent's latent via
                 # embedding insertion (RoPE fresh), then decode the round answer.
                 jmsg = self._build_graph_latent_judger_msg(judger)

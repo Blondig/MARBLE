@@ -352,10 +352,10 @@ class ModelWrapper:
         """Coconut-style latent reasoning; returns the accumulated KV cache.
 
         The first forward consumes ``input_ids`` (default path, unchanged from
-        upstream) OR ``inputs_embeds`` ``[B, L, H]``. The returned KV contains
-        those consumed positions plus the latent positions generated below. For
-        graph-latent read-only side context, use ``generate_latent_with_context``
-        instead of storing this return value directly.
+        upstream) OR ``inputs_embeds`` ``[B, L, H]`` (used by ``absorb_embeds`` to
+        deliver a neighbour's latent into a receiver's KV over the side channel).
+        The returned KV contains those consumed positions plus the latent
+        positions generated below.
 
         If ``return_latent_embeds`` is True, also returns the sequence of latent
         embeddings produced this call as ``(past, embeds)`` where ``embeds`` is
@@ -542,47 +542,24 @@ class ModelWrapper:
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
     @torch.no_grad()
-    def generate_latent_with_context(
-        self,
-        prompt_text: str,
-        past_key_values: Optional[Tuple],
-        *,
-        latent_steps: int,
-        neighbor_latents: Optional[List[torch.Tensor]] = None,
-        return_latent_embeds: bool = True,
-        insert_marker: str = "<|im_start|>user\n",
-    ) -> Any:
-        """Latent reasoning with read-only neighbour latent side context.
+    def absorb_embeds(
+        self, past_key_values: Optional[Tuple], embeds: Optional[torch.Tensor]
+    ) -> Optional[Tuple]:
+        """DELIVER a sender's latent into a receiver's KV: append ``embeds``
+        (``[1, steps, H]``) to ``past_key_values`` and return the grown cache.
 
-        A temporary pass inserts neighbour latent embeddings into the prompt and
-        generates this agent's new latent embeddings. That temporary KV is
-        discarded. A second pass persists only this agent's prompt plus the new
-        latent embeddings into its own carried KV, so the neighbour's latent prefix
-        is not copied into this agent's long-term cache.
+        This is the graph-latent "side" channel (graph PUSH, mirroring
+        new_communication_session): the receiver ACCUMULATES the sender's latent
+        into its own working memory and carries it across rounds, just as a graph
+        agent accumulates received messages in memory. Delivery is an embed-append
+        (RoPE applied fresh at the receiver's continuing positions), NOT a raw
+        cross-agent KV concat -- the latter would mis-rotate the cached keys.
         """
-        kv_for_context = self._copy_cache(past_key_values)
-        context_combined = self._build_prompt_embeds(
-            prompt_text, neighbor_latents, insert_marker=insert_marker
+        if embeds is None or embeds.shape[1] == 0:
+            return past_key_values
+        return self.generate_latent_batch(
+            inputs_embeds=embeds, latent_steps=0, past_key_values=past_key_values
         )
-        _, contextual_embeds = self.generate_latent_batch(
-            inputs_embeds=context_combined,
-            latent_steps=latent_steps,
-            past_key_values=kv_for_context,
-            return_latent_embeds=True,
-        )
-
-        kv_for_persist = past_key_values
-        prompt_only = self._build_prompt_embeds(prompt_text, None)
-        own_segment = torch.cat([prompt_only, contextual_embeds], dim=1)
-        own_past = self.generate_latent_batch(
-            inputs_embeds=own_segment,
-            latent_steps=0,
-            past_key_values=kv_for_persist,
-            return_latent_embeds=False,
-        )
-        if return_latent_embeds:
-            return own_past, contextual_embeds
-        return own_past
 
     # ------------------------------------------------------------------ #
     # Latent-MAS additions (graph-latent building blocks).
