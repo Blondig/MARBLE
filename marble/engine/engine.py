@@ -1640,10 +1640,10 @@ class Engine:
                             past_key_values=agent_kvs[aid],
                         )
                         if tgt and latent_steps > 0:
-                            # The "message" is the sender's latent thoughts (the
-                            # tail latent vectors), not its prompt embeds.
+                            # The "message" is the sender's latent thoughts (embeds
+                            # is already latents-only).
                             agent_kvs[tgt] = model.absorb_embeds(
-                                agent_kvs[tgt], embeds[:, -latent_steps:, :]
+                                agent_kvs[tgt], embeds
                             )
                             round_comms.append(
                                 {"from": aid, "to": tgt, "channel": "latent"}

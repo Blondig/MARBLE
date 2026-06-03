@@ -437,12 +437,6 @@ class ModelWrapper:
         past = outputs.past_key_values
 
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [B, D]
-        # Upstream generate_latent_batch_hidden_state harvests the prompt's INPUT
-        # embeddings (hidden_states[0]) followed by the latent vectors, so a
-        # hierarchical reader sees the latents grounded by normal token embeds.
-        prompt_embeds_harvest = (
-            outputs.hidden_states[0] if return_latent_embeds else None
-        )
 
         latent_vecs: List[torch.Tensor] = []
         for step in range(latent_steps):
@@ -470,8 +464,17 @@ class ModelWrapper:
 
         self.token_usage += int(batch * (seq_len + latent_steps))
         if return_latent_embeds:
-            # [prompt input-embeds ++ latent vecs], matching upstream.
-            embeds = torch.cat([prompt_embeds_harvest] + latent_vecs, dim=1)
+            # Harvest ONLY the latent "thoughts" (upstream latent_only mode), NOT
+            # the prompt input-embeds. The reader (bridge/neighbour) is grounded by
+            # the task in its OWN prompt -- exactly like graph's planner, whose
+            # summarize_output / decide_next_step prompts already contain the task.
+            # Inserting each agent's full prompt embeds too would flood the decode
+            # on MARBLE's long tasks (N x full task as raw embeddings) and collapse
+            # it; the latents are the agents' "results" appended to that prompt.
+            if latent_vecs:
+                embeds = torch.cat(latent_vecs, dim=1)
+            else:
+                embeds = last_hidden.new_zeros((batch, 0, last_hidden.shape[-1]))
             return past, embeds
         return past
 
