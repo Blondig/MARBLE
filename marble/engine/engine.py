@@ -1754,20 +1754,11 @@ class Engine:
             summary_data["decoded_tokens"] = (
                 int(model.tokenize_text(final_output).shape[-1]) if final_output else 0
             )
-            # Code-generation task: persist the judger-decoded solution and score
-            # it with the same LLM code-quality judge as graph (4 criteria, 1-5),
-            # so latent vs text coding runs are directly comparable.
+            # Code-generation task: persist the judger-decoded solution.py only.
+            # Code-quality scoring is done OFFLINE in batch once all solutions
+            # exist (scripts/coding/eval_coding_solutions.py), NOT inline here.
             if self.environment.name == "Coding Environment":
                 self._write_latent_solution(final_output)
-                try:
-                    self.evaluator.evaluate_code_quality(self.task, final_output)
-                    summary_data["code_quality"] = self.evaluator.metrics[
-                        "code_quality"
-                    ]
-                except Exception:
-                    self.logger.exception(
-                        "graph-latent code-quality evaluation failed."
-                    )
         except Exception:
             self.logger.exception("An error occurred during graph-latent coordination.")
             raise
