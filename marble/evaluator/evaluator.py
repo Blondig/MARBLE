@@ -590,14 +590,17 @@ class Evaluator:
                 solution=solution_content
             )
 
-            # Call the LLM
+            # Call the LLM. NOTE: temperature is non-zero on purpose -- Qwen3 MoE
+            # judges (e.g. Qwen3-30B-A3B) explicitly warn that greedy decoding
+            # (temperature=0) degrades into endless repetition, which corrupts the
+            # JSON score. 0.3 keeps scores stable while avoiding greedy collapse.
             response = model_prompting(
                 llm_model=self.llm,
                 messages=[{"role": "user", "content": prompt}],
                 return_num=1,
                 max_token_num=4096,
-                temperature=0.0,
-                top_p=None,
+                temperature=0.3,
+                top_p=0.8,
                 stream=None,
             )[0]
 
