@@ -365,10 +365,9 @@ class ModelWrapper:
         """Coconut-style latent reasoning; returns the accumulated KV cache.
 
         The first forward consumes ``input_ids`` (default path, unchanged from
-        upstream) OR ``inputs_embeds`` ``[B, L, H]`` (used by ``absorb_embeds`` to
-        deliver a neighbour's latent into a receiver's KV over the side channel).
-        The returned KV contains those consumed positions plus the latent
-        positions generated below.
+        upstream) OR ``inputs_embeds`` ``[B, L, H]`` (deliver pre-computed latent
+        into a KV cache without re-tokenizing). The returned KV contains those
+        consumed positions plus the latent positions generated below.
 
         If ``return_latent_embeds`` is True, also returns the sequence of latent
         embeddings produced this call as ``(past, embeds)`` where ``embeds`` is
@@ -526,6 +525,7 @@ class ModelWrapper:
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.95,
+        do_sample: bool = True,
         insert_marker: str = "<|im_start|>user\n",
     ) -> str:
         """
@@ -545,41 +545,24 @@ class ModelWrapper:
         attention_mask = torch.ones(
             combined.shape[:2], dtype=torch.long, device=combined.device
         )
-        outputs = self.model.generate(
+        gen_kwargs: Dict[str, Any] = dict(
             inputs_embeds=combined,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
+            do_sample=do_sample,
             pad_token_id=self.tokenizer.pad_token_id,
             return_dict_in_generate=True,
             output_scores=False,
         )
+        # Only pass sampling params when sampling, so a deterministic decode
+        # (do_sample=False) doesn't trip transformers' temperature/top_p warnings.
+        if do_sample:
+            gen_kwargs.update(temperature=temperature, top_p=top_p)
+        outputs = self.model.generate(**gen_kwargs)
         # With inputs_embeds (no input_ids), generate() returns only new tokens.
         gen_ids = outputs.sequences[0]
         self.token_usage += int(combined.shape[0] * combined.shape[1] + gen_ids.numel())
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-
-    @torch.no_grad()
-    def absorb_embeds(
-        self, past_key_values: Optional[Tuple], embeds: Optional[torch.Tensor]
-    ) -> Optional[Tuple]:
-        """DELIVER a sender's latent into a receiver's KV: append ``embeds``
-        (``[1, steps, H]``) to ``past_key_values`` and return the grown cache.
-
-        This is the graph-latent "side" channel (graph PUSH, mirroring
-        new_communication_session): the receiver ACCUMULATES the sender's latent
-        into its own working memory and carries it across rounds, just as a graph
-        agent accumulates received messages in memory. Delivery is an embed-append
-        (RoPE applied fresh at the receiver's continuing positions), NOT a raw
-        cross-agent KV concat -- the latter would mis-rotate the cached keys.
-        """
-        if embeds is None or embeds.shape[1] == 0:
-            return past_key_values
-        return self.generate_latent_batch(
-            inputs_embeds=embeds, latent_steps=0, past_key_values=past_key_values
-        )
 
     # ------------------------------------------------------------------ #
     # Latent-MAS additions (graph-latent building blocks).

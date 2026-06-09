@@ -1284,59 +1284,6 @@ class Engine:
             {"role": "user", "content": user},
         ]
 
-    def _build_graph_latent_worker_msg(
-        self, agent: BaseAgent, first_round: bool
-    ) -> List[Dict[str, str]]:
-        """One worker (graph node) message for graph_latent_coordinate.
-
-        Round 1 encodes the FULL task (it then lives in the agent's own KV).
-        Round >= 2 feeds only a short "continue" instruction -- the task and all
-        prior reasoning (its own + any latent pushed in by neighbours) are already
-        in the carried KV. The planner's summary is NOT injected, mirroring graph,
-        where an agent re-plans from its own memory, not the planner's output.
-        """
-        profile = agent.get_profile()
-        if first_round:
-            user = (
-                f"You are {agent.agent_id}: {profile}\n"
-                f"Task: {self.task}\n"
-                "Reason toward solving this task from your role's perspective. "
-                "Your reasoning is shared with the team as latent working memory."
-            )
-        else:
-            user = (
-                f"You are {agent.agent_id}: {profile}\n"
-                "Continue and improve your reasoning for the same task. Everything "
-                "you and your teammates have contributed is already in your working "
-                "memory (KV) -- build on it; do NOT restate the task."
-            )
-        return [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": user},
-        ]
-
-    def _build_graph_latent_summarizer_msg(self) -> List[Dict[str, str]]:
-        """White-box BRIDGE prompt for graph_latent_coordinate.
-
-        The agents' latent reasoning is inserted as input embeddings by
-        ModelWrapper.generate_text_from_embeds; this decodes it into a text round
-        answer -- i.e. the agents->planner communication channel in latent form.
-        The decoded text then feeds the real EnginePlanner (summarize_output /
-        decide_next_step), exactly as graph_coordinate feeds it the text results.
-        """
-        user = (
-            "You are the team coordinator. You are given the agents' latent "
-            "reasoning as working memory.\n"
-            f"Task: {self.task}\n"
-            "Use it as reference (ignore irrelevant parts) and produce the final "
-            "answer to the task.\n"
-            f"Output format: {self.output_format}"
-        )
-        return [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": user},
-        ]
-
     def fixed_chain_coordinate(self) -> None:
         """
         Fixed-pipeline TEXT baseline, structurally mirroring latent_coordinate.
@@ -1502,36 +1449,25 @@ class Engine:
         ]
 
     def graph_latent_coordinate(self) -> None:
-        """
-        Graph-latent coordination (v1 skeleton: per-agent KV + hierarchical
-        aggregation). NOT a literal latent replica of graph_coordinate.
+        """Graph coordination with a LATENT agent<->agent communication channel.
 
-        Structure (follows graph_coordinate; only the agents->planner channel is
-        latent):
-        - ALL config agents work (reason in latent), each with its OWN latent
-          working memory (kv_i), carried across rounds and never cleared. Round 1
-          encodes the full task; round >= 2 feeds only a short "continue + latest
-          summary" instruction so the KV grows by a small delta per round.
-        - Side (agent<->agent) = graph PUSH: an agent routes (plaintext, over its
-          relationships) and pushes its latent thoughts into a neighbour's KV
-          (RoPE-safe embed append), which the neighbour accumulates -- mirroring
-          new_communication_session.
-        - agents -> planner communication is the ONLY latent-specific aggregation:
-          a white-box bridge attends all agents' latent (embedding insertion, RoPE
-          fresh) and decodes a text round answer (replaces graph's text
-          _summarize_results).
-        - From there it REUSES the standalone EnginePlanner exactly as graph:
-          summarize_output formats the summary, evaluate_planning scores it,
-          decide_next_step decides stop, update_progress advances. The planner is
-          NOT a config agent.
+        Identical to ``graph_coordinate`` -- the SAME ``agent.act()`` loop, the
+        same coding tool chain (create/revise -> solution.py), the same
+        ``EnginePlanner``, scoring and JSONL schema -- with ONE change: the
+        agent<->agent communication channel (``new_communication_session``) is
+        executed as a LATENT two-party exchange instead of a multi-turn text chat.
 
-        Deferred to a later step:
-        - multi-turn side dialogue; agent<->tool channel (db/research/minecraft).
+        A shared white-box ``ModelWrapper`` is attached to every agent;
+        ``BaseAgent._handle_new_communication_session`` then routes to its latent
+        variant (``_handle_latent_communication_session``): the two agents take
+        turns reasoning in latent from their own profile + memory over a shared
+        conversation KV, then the INITIATOR decodes a summary into ITS OWN memory
+        -- the same landing point as the text path's final summary. The target's
+        ``act()`` does not read the exchange, exactly as in the text baseline.
 
-        Output schema matches graph_coordinate (iterations/planning_scores/
-        communication_scores/agent_kpis/total_milestones/token_usage/
-        task_evaluation) for comparability, with latent-only extras appended; but
-        communication is -1 (no text) and KPI is N/A, exactly as for latent.
+        Everything else -- crucially HOW the deliverable is produced (the tool
+        channel) -- is the text baseline unchanged, so the run isolates latent-vs
+        -text COMMUNICATION TRANSPORT and stays directly comparable to graph.
         """
         import torch
 
@@ -1540,268 +1476,27 @@ class Engine:
         cfg = self.config.latent or {}
         model_name = cfg.get("model_name", "Qwen/Qwen2.5-7B-Instruct")
         latent_steps = int(cfg.get("latent_steps", 10))
-        max_new_tokens = int(cfg.get("max_new_tokens", 512))
-        temperature = float(cfg.get("temperature", 0.7))
-        top_p = float(cfg.get("top_p", 0.95))
-        latent_space_realign = bool(cfg.get("latent_space_realign", False))
+        # None => the latent exchange inherits the text session's turn count;
+        # set latent_comm_turns in the latent config only to override it.
+        latent_comm_turns = cfg.get("latent_comm_turns")
+        realign = bool(cfg.get("latent_space_realign", False))
         device = torch.device(
             cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        # Same top-level schema as graph_coordinate (iterations + the standard
-        # metric fields), plus latent-only extras appended at the end.
-        summary_data: Dict[str, Any] = {
-            "task": self.task,
-            "coordination_mode": self.coordinate_mode,
-            "communication_mode": "latent_mas",
-            "model_name": model_name,
-            "latent_steps": latent_steps,
-            "iterations": [],
-        }
-        try:
-            model = ModelWrapper(
-                model_name, device, latent_space_realign=latent_space_realign
-            )
-            agents = self.graph.get_all_agents()
-            if not agents:
-                self.logger.error("No agents found for graph-latent coordination.")
-                return
-            # Follow graph: ALL config agents work (reason in latent). The
-            # summarizer/decider is the standalone EnginePlanner (self.planner),
-            # NOT a config agent -- exactly as graph_coordinate. The only latent
-            # change is the agents->planner channel: instead of text results, the
-            # planner is fed a white-box bridge decode of the agents' latent.
-            workers = agents
-            agent_profiles = self._get_agent_profiles()
-            agent_tasks_str = self._format_agent_tasks(
-                {agent.agent_id: self.task for agent in agents}
-            )
-
-            # Per-agent latent working memory (kv_i), carried across rounds and
-            # NEVER cleared: each graph node keeps its own KV. Round 1 encodes the
-            # full task; round >= 2 feeds only a short "continue" instruction (the
-            # task already lives in kv_i), so each KV grows by a small delta per
-            # round instead of re-pasting the task.
-            agent_kvs: Dict[str, Any] = {a.agent_id: None for a in workers}
-            # Agents that have reasoned at least once. A KV can become non-None
-            # before its owner reasons (a neighbour pushed latent into it over the
-            # side channel), so "first round / encode the full task" is tracked by
-            # reasoning, not by KV being None.
-            reasoned: set = set()
-            total_latent_steps = 0
-            final_output = ""
-            summary_text = ""
-            for rnd in range(max(1, self.max_iterations)):
-                # Each worker reasons in latent on its OWN carried KV, and exposes
-                # its latent "thoughts" (embeds) for the summarizer bridge to read.
-                round_latent_embeds: List[Any] = []
-                round_comms: List[Dict[str, str]] = []
-                for agent in workers:
-                    aid = agent.agent_id
-                    first_round = aid not in reasoned
-                    messages = self._build_graph_latent_worker_msg(
-                        agent, first_round=first_round
-                    )
-                    # Reason in latent on this agent's OWN carried KV -- which may
-                    # already hold latent pushed in by a neighbour over the side
-                    # channel (this/last round). The new latent embeds are exposed
-                    # for the summarizer bridge to read.
-                    _, ids, mask, _ = model.prepare_chat_batch([messages])
-                    kv_new, embeds = model.generate_latent_batch(
-                        ids,
-                        attention_mask=mask,
-                        latent_steps=latent_steps,
-                        past_key_values=agent_kvs[aid],
-                        return_latent_embeds=True,
-                    )
-                    agent_kvs[aid] = kv_new  # carry forward, no clear
-                    round_latent_embeds.append(embeds)
-                    reasoned.add(aid)
-                    total_latent_steps += latent_steps
-
-                    # Part A (side): graph PUSH. Like new_communication_session, the
-                    # agent decides (plaintext route over its graph neighbours)
-                    # whether to send THIS round's latent to a teammate; the teammate
-                    # ACCUMULATES it into its own KV (RoPE-safe embed append, never a
-                    # raw-KV concat). Candidates are NOT filtered by whether the
-                    # teammate has produced latent -- what flows is the sender's own.
-                    targets = [n for n in self._graph_neighbors(aid) if n in agent_kvs]
-                    if targets:
-                        # Route like graph's new_communication_session: the choice
-                        # is conditioned on the agent's OWN current reasoning state
-                        # (its carried KV, read-only), not the planner's summary --
-                        # graph routes from the agent's own memory. This also makes
-                        # it vary across rounds as the KV grows.
-                        tgt = model.decode_choice(
-                            f"You are {aid} ({agent.get_profile()}). Based on your "
-                            "current reasoning so far, which teammate (if any) should "
-                            "you share it with to help solve the task?",
-                            targets,
-                            past_key_values=agent_kvs[aid],
-                        )
-                        if tgt and latent_steps > 0:
-                            # The "message" is the sender's latent thoughts (embeds
-                            # is already latents-only).
-                            agent_kvs[tgt] = model.absorb_embeds(
-                                agent_kvs[tgt], embeds
-                            )
-                            round_comms.append(
-                                {"from": aid, "to": tgt, "channel": "latent"}
-                            )
-                            self.logger.info(
-                                f"[graph-latent] {aid} pushed latent to {tgt}."
-                            )
-                # Agents -> planner communication via INPUT EMBEDS (the latent
-                # channel): a white-box bridge reads ALL agents' latent (inserted as
-                # embeds, RoPE fresh) and decodes a text round answer. This is the
-                # only latent-specific step; it replaces graph's text
-                # _summarize_results. Everything below REUSES the real EnginePlanner.
-                bmsg = self._build_graph_latent_summarizer_msg()
-                bprompt = model.render_chat(bmsg, add_generation_prompt=True)
-                final_output = model.generate_text_from_embeds(
-                    bprompt,
-                    round_latent_embeds,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                ).strip()
-
-                # From here on, IDENTICAL to graph_coordinate: the standalone
-                # EnginePlanner formats the summary, planning is scored, and the
-                # planner decides whether to continue and updates its progress.
-                summary = self.planner.summarize_output(
-                    final_output, self.task, self.output_format
-                )
-                summary_text = summary.content
-
-                # communication is -1 (latent, no text to score), KPI N/A.
-                self.evaluator.metrics["communication_score"].append(-1)
-                try:
-                    self.evaluator.evaluate_planning(
-                        summary_text, agent_profiles, agent_tasks_str, final_output
-                    )
-                except Exception:
-                    self.logger.exception("graph-latent planning evaluation failed.")
-                    self.evaluator.metrics["planning_score"].append(-1)
-
-                continue_simulation = self.planner.decide_next_step(
-                    [{"team_latent_summary": final_output}]
-                )
-                if continue_simulation:
-                    self.planner.update_progress(summary_text)
-                summary_data["iterations"].append(
-                    {
-                        "iteration": rnd + 1,
-                        "task_assignments": {a.agent_id: self.task for a in agents},
-                        "task_results": [{"summarizer": final_output}],
-                        "summary": summary_text,
-                        "continue_simulation": continue_simulation,
-                        "communications": round_comms,
-                        "communication_note": (
-                            "latent route metadata only; content is exchanged as "
-                            "latent embeddings/KV and is not text-scored."
-                        ),
-                        "total_milestones": 0,
-                        "agent_kpis": {},
-                    }
-                )
-                self.logger.info(
-                    f"[graph-latent] round {rnd + 1} done (continue={continue_simulation})."
-                )
-                if not continue_simulation:
-                    break
-
-            # Top-level metrics: identical fields to graph_coordinate.
-            summary_data["planning_scores"] = self.evaluator.metrics["planning_score"]
-            summary_data["communication_scores"] = self.evaluator.metrics[
-                "communication_score"
-            ]
-            valid_planning = [
-                s for s in summary_data["planning_scores"] if s is not None and s >= 0
-            ]
-            summary_data["communication_note"] = (
-                "not scored: latent route metadata is logged, but the communication "
-                "score rates inter-agent text messages."
-            )
-            summary_data["coordination_score"] = (
-                sum(valid_planning) / len(valid_planning) if valid_planning else None
-            )
-            # KPI/milestone attribution is N/A for latent (no per-agent text);
-            # fields kept for schema parity with graph, values marked N/A.
-            summary_data["agent_kpis"] = {}
-            summary_data["total_milestones"] = None
-            summary_data["kpi_note"] = (
-                "not scored: milestone KPI / per-agent attribution needs each "
-                "agent's text output; latent agents produce only KV."
-            )
-            summary_data["token_usage"] = (
-                self._get_totoal_token_usage() + getattr(model, "token_usage", 0)
-            )
-            # Per-environment task score (same dispatch as graph_coordinate).
-            try:
-                env_name = self.environment.name
-                if env_name == "Research Environment":
-                    self.evaluator.evaluate_task_research(self.task, summary_text)
-                    summary_data["task_evaluation"] = self.evaluator.metrics[
-                        "task_evaluation"
-                    ]
-                elif env_name == "World Simulation Environment":
-                    self.evaluator.evaluate_task_world(self.task, summary_text)
-                    summary_data["task_evaluation"] = self.evaluator.metrics[
-                        "task_evaluation"
-                    ]
-                elif env_name == "DB Environment":
-                    self.evaluator.evaluate_task_db(
-                        self.task,
-                        summary_text,
-                        self.config.task["labels"],
-                        self.config.task["number_of_labels_pred"],
-                        self.config.task["root_causes"],
-                    )
-                    summary_data["task_evaluation"] = self.evaluator.metrics[
-                        "task_evaluation"
-                    ]
-            except Exception:
-                self.logger.exception("graph-latent task evaluation failed.")
-            # Latent-only extras (added on top of the standard fields).
-            summary_data["final_output"] = final_output
-            summary_data["total_latent_steps"] = total_latent_steps
-            summary_data["decoded_tokens"] = (
-                int(model.tokenize_text(final_output).shape[-1]) if final_output else 0
-            )
-            # Code-generation task: persist the bridge-decoded solution.py only.
-            # Code-quality scoring is done OFFLINE in batch once all solutions
-            # exist (scripts/coding/eval_coding_solutions.py), NOT inline here.
-            if self.environment.name == "Coding Environment":
-                self._write_latent_solution(final_output)
-        except Exception:
-            self.logger.exception("An error occurred during graph-latent coordination.")
-            raise
-        finally:
-            self.evaluator.finalize()
-            self._write_to_jsonl(summary_data)
-            self.logger.info("Graph-latent coordination simulation completed.")
-
-    def _write_latent_solution(self, final_output: str) -> None:
-        """
-        Extract a python code block from the judger output and write it to the
-        coding workspace as solution.py (the artifact the coder tool would have
-        produced in the text baseline).
-        """
-        import os
-        import re
-
-        match = re.search(r"```python(.*?)```", final_output, re.DOTALL)
-        code = match.group(1).strip() if match else final_output.strip()
-        workspace = getattr(self.environment, "workspace_dir", "workspace")
-        os.makedirs(workspace, exist_ok=True)
-        path = os.path.join(workspace, "solution.py")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(code)
-            self.logger.info(f"[graph-latent] wrote solution to {path}")
-        except IOError as e:
-            self.logger.error(f"Failed to write latent solution: {e}")
+        self.logger.info(
+            f"[graph-latent] latent agent<->agent comm channel ON "
+            f"(model={model_name}, latent_steps={latent_steps}, "
+            f"comm_turns={latent_comm_turns or 'inherit text turns'}); "
+            "act()/tools/planner/scoring unchanged from the text graph."
+        )
+        model = ModelWrapper(model_name, device, latent_space_realign=realign)
+        for agent in self.graph.get_all_agents():
+            agent.latent_comm_model = model
+            agent.latent_comm_steps = latent_steps
+            agent.latent_comm_turns = latent_comm_turns
+        # Reuse the text-graph pipeline verbatim; only the comm channel differs.
+        self.graph_coordinate()
 
     def start(self) -> None:
         """
@@ -1903,23 +1598,6 @@ class Engine:
         """
         # Assuming each communication is a string or can be converted to string
         return "\n".join(str(c) for c in communications)
-
-    def _graph_neighbors(self, agent_id: str) -> List[str]:
-        """
-        Return graph neighbours for an agent using the same undirected-link
-        semantics as AgentGraph.get_agent_profiles_linked.
-        """
-        linked = set()
-        for source, target, _ in getattr(self.graph, "relationships", []):
-            if source == agent_id:
-                linked.add(target)
-            elif target == agent_id:
-                linked.add(source)
-        return [
-            agent.agent_id
-            for agent in self.graph.get_all_agents()
-            if agent.agent_id in linked
-        ]
 
     def _get_agent_profiles(self) -> str:
         """

@@ -71,6 +71,16 @@ class BaseAgent:
         )
         self.memory = BaseMemory()
         self.shared_memory = SharedMemory()
+        # graph-latent: when an engine attaches a shared white-box model here, the
+        # agent<->agent communication channel (new_communication_session) is run in
+        # LATENT form -- a two-party latent exchange -- instead of a multi-turn text
+        # chat. Everything else (act/tools/planner) is untouched. No persistent
+        # latent state is kept across calls. Off (None) by default.
+        self.latent_comm_model: Any = None
+        self.latent_comm_steps: int = 10  # latent reasoning steps per speaker turn
+        # None => inherit the text session's `turns` (so the latent exchange runs
+        # the SAME number of turns as the baseline); set only to OVERRIDE it.
+        self.latent_comm_turns: Optional[int] = None
         self.relationships: Dict[str, str] = {}
         self.logger = get_logger(self.__class__.__name__)
         self.logger.info(f"Agent '{self.agent_id}' initialized.")
@@ -412,6 +422,12 @@ class BaseAgent:
         Returns:
             Dict[str, Any]: Result of the communication attempt
         """
+        # graph-latent: route this channel (and ONLY this channel) to its latent
+        # variant when an engine has attached a shared white-box model.
+        if getattr(self, "latent_comm_model", None) is not None:
+            return self._handle_latent_communication_session(
+                target_agent_id, message, session_id, task, turns
+            )
         initial_communication = self._handle_communicate_to(
             target_agent_id, message, session_id
         )
@@ -547,6 +563,186 @@ class BaseAgent:
             ),
             "session_id": result.content if result.content else "",
         }
+
+    def _handle_latent_communication_session(
+        self,
+        target_agent_id: str,
+        message: str,
+        session_id: str,
+        task: str,
+        turns: int = 5,
+    ) -> Dict[str, Any]:
+        """Latent variant of ``new_communication_session`` (graph-latent only).
+
+        A LATENT analogue of the text session: a real two-party exchange where
+        BOTH agents reason, with only the TRANSPORT changed (latent reasoning
+        instead of decoded text turns). It mirrors ``_handle_new_communication_session``:
+
+        - Runs UP TO the same number of turns as the text baseline (the ``turns``
+          it was called with, default 5); ``latent_comm_turns`` only OVERRIDES this
+          if a config sets it. Speakers alternate, TARGET first (text uses
+          ``agents = [target, self]``). Like the text path's ``<end-of-session>``,
+          a speaker may END early: after both have spoken, a tiny plaintext control
+          (``decode_bool``) decides whether to stop -- so this aligns the MAX turns
+          and, like text, the actual turn count can be shorter.
+        - Each turn the speaker reasons in latent from ITS OWN profile + memory,
+          conditioned on the conversation SO FAR. Crucially the shared conversation
+          carries ONLY each speaker's latent CONTRIBUTION, never its raw prompt or
+          memory: a speaker's memory shapes only its own contribution, exactly like
+          the text baseline where one agent never directly consumes another's raw
+          memory. (Implementation: the shared-context KV is rebuilt each turn from
+          the contribution embeds only; the KV that consumed a speaker's private
+          prompt+memory is discarded.)
+        - After the turns, the INITIATOR decodes a summary into ITS OWN memory --
+          the same landing point as the text path's final summary. The target's
+          ``act()`` does not read the exchange, exactly as in graph.
+
+        The only difference vs the text baseline is therefore the transport. The
+        white-box cost is charged to the initiator's ``token_usage`` (the text
+        session charges all turns to the initiator too).
+
+        Decode is DETERMINISTIC (``do_sample=False``) to match the text comm's
+        ``temperature=0.0``; latent reasoning steps generate no tokens (pure
+        forward passes), so the only stochastic step would be the summary decode.
+
+        NOTE (scoring): the returned ``full_chat_history`` is the DECODED summary,
+        so ``evaluate_communication`` scores that text -- NOT the latent itself, and
+        NOT a verbatim multi-turn chat history. Read communication_score with that
+        in mind (it is not directly comparable to the text full-chat score).
+        """
+        model = self.latent_comm_model
+        assert (
+            self.agent_graph is not None
+        ), "Agent graph is not set. Please set the agent graph using the set_agent_graph method first."
+        # Explicit neighbour check (the act() tool enum already constrains targets
+        # to self.relationships; this guards against any other caller).
+        if target_agent_id not in self.relationships:
+            return {
+                "success": False,
+                "error-msg": f"No relationship with agent {target_agent_id}",
+            }
+        target = self.agent_graph.agents.get(target_agent_id)
+        if target is None:
+            return {
+                "success": False,
+                "error-msg": f"No such target agent {target_agent_id}",
+            }
+        try:
+            before = int(getattr(model, "token_usage", 0))
+            steps = int(getattr(self, "latent_comm_steps", 10))
+            # Inherit the text session's turn count; config only overrides it.
+            override = getattr(self, "latent_comm_turns", None)
+            n_turns = int(override) if override else int(turns)
+            if n_turns < 1:
+                n_turns = int(turns)
+
+            # Alternating speakers, target first (mirrors text agents=[target, self]).
+            speakers = [target, self]
+            contribs: List[Any] = []  # shared conversation: CONTRIBUTION embeds only
+            for t in range(n_turns):
+                speaker = speakers[t % 2]
+                other = speakers[(t + 1) % 2]
+                # Rebuild the shared-context KV from prior CONTRIBUTIONS only, so a
+                # speaker's private prompt+memory never leaks into the next speaker.
+                ctx_kv: Any = None
+                for c in contribs:
+                    ctx_kv = model.generate_latent_batch(
+                        inputs_embeds=c, latent_steps=0, past_key_values=ctx_kv
+                    )
+                turn_msg = [
+                    {"role": "system", "content": speaker.system_message},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"You are {speaker.agent_id}: {speaker.get_profile()}\n"
+                            f"Your memory: {speaker.memory.get_memory_str()}\n"
+                            f"Task: {task}\n"
+                            f"You are coordinating with {other.agent_id} on this topic: "
+                            f"{message}\n"
+                            "Reason about your contribution to advance the task."
+                        ),
+                    },
+                ]
+                _, ids, mask, _ = model.prepare_chat_batch([turn_msg])
+                # Reason on the speaker's OWN (private) prompt, conditioned on the
+                # shared contributions; the resulting KV (which absorbed the private
+                # prompt+memory) is discarded -- only the contribution is kept.
+                _, embeds = model.generate_latent_batch(
+                    ids,
+                    attention_mask=mask,
+                    latent_steps=steps,
+                    past_key_values=ctx_kv,
+                    return_latent_embeds=True,
+                )
+                contribs.append(embeds)
+
+                # Early stop, mirroring text's <end-of-session>: a tiny plaintext
+                # CONTROL decode (content stays latent) decides whether to stop.
+                # Allowed once both agents have spoken, and skipped on the last turn
+                # (the loop ends anyway). decode_bool copies the KV, so conditioning
+                # on the conversation-so-far does not mutate it.
+                if 2 <= t + 1 < n_turns:
+                    conv_kv = model.generate_latent_batch(
+                        inputs_embeds=embeds, latent_steps=0, past_key_values=ctx_kv
+                    )
+                    if model.decode_bool(
+                        conv_kv,
+                        f"You are {speaker.agent_id}, coordinating with "
+                        f"{other.agent_id}. Is this exchange resolved with nothing "
+                        "useful left to add, so the session should end?",
+                    ):
+                        self.logger.info(
+                            f"[latent comm] {speaker.agent_id} ended the session "
+                            f"early at turn {t + 1}/{n_turns}."
+                        )
+                        break
+
+            # The INITIATOR decodes a summary of the exchange (deterministic) and
+            # stores it in ITS OWN memory -- strict parity with the text path.
+            brief_msg = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {
+                    "role": "user",
+                    "content": (
+                        f"You are {self.agent_id}, coordinating with {target_agent_id}. "
+                        f"Summarize the exchange into short, actionable notes for the "
+                        f"task: {task}"
+                    ),
+                },
+            ]
+            bprompt = model.render_chat(brief_msg, add_generation_prompt=True)
+            briefing = model.generate_text_from_embeds(
+                bprompt, contribs, max_new_tokens=256, do_sample=False
+            ).strip()
+
+            self.memory.update(
+                self.agent_id,
+                {
+                    "type": "action_communicate_latent",
+                    "action_name": "latent_comm",
+                    "to": target_agent_id,
+                    "result": briefing,
+                },
+            )
+            # Charge the white-box cost to the initiator so the engine total sees it.
+            self.token_usage += max(0, int(getattr(model, "token_usage", 0)) - before)
+
+            self.logger.info(
+                f"Agent {self.agent_id} ran latent comm with {target_agent_id} "
+                f"({len(contribs)}/{n_turns} turns x {steps} steps); "
+                f"summary in {self.agent_id}'s memory."
+            )
+            return {
+                "success": True,
+                "message": f"latent comm {self.agent_id} <-> {target_agent_id}",
+                "full_chat_history": (
+                    f"[latent {self.agent_id}<->{target_agent_id}] {briefing}"
+                ),
+                "session_id": session_id,
+            }
+        except Exception as e:
+            self.logger.error(f"latent communication failed: {e}")
+            return {"success": False, "error-msg": f"latent communication failed: {e}"}
 
     def _handle_communicate_to(
         self, target_agent_id: str, message: str, session_id: str
