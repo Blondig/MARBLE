@@ -648,8 +648,9 @@ class BaseAgent:
                 "success": False,
                 "error-msg": f"No such target agent {target_agent_id}",
             }
+        before = int(getattr(model, "token_usage", 0))
+        charged = False
         try:
-            before = int(getattr(model, "token_usage", 0))
             steps = int(getattr(self, "latent_comm_steps", 10))
             # Inherit the text session's turn count; config only overrides it.
             override = getattr(self, "latent_comm_turns", None)
@@ -694,12 +695,17 @@ class BaseAgent:
 
             # The ONLY new text fed per turn (the full context already lives in the
             # speaker's running KV) -- so each turn pays just instruction + steps.
-            _, instr_ids, instr_mask, _ = model.prepare_chat_batch(
-                [{
+            # NOTE: prepare_chat_batch wants List[List[Dict]] (a BATCH of message
+            # lists). instr_msg is ONE message list; batch it as [instr_msg], same
+            # as the prefix above ([prefix_msg]). Passing [ {..} ] would make the
+            # template receive a bare dict -> "dict object has no element 0".
+            instr_msg = [
+                {
                     "role": "user",
                     "content": "Continue: add a brief latent contribution to advance the task.",
-                }]
-            )
+                }
+            ]
+            _, instr_ids, instr_mask, _ = model.prepare_chat_batch([instr_msg])
 
             # Each running[id] = its private prefix + ALL shared contributions so
             # far -- a clean, symmetric contribution stream (no per-turn instruction
@@ -780,11 +786,12 @@ class BaseAgent:
             delta = max(0, int(getattr(model, "token_usage", 0)) - before)
             self.token_usage += delta
             self.comm_token_usage += delta
+            charged = True
 
             self.logger.info(
                 f"Agent {self.agent_id} ran latent comm with {target_agent_id} "
                 f"({len(contribs)}/{n_turns} turns x {steps} steps); "
-                f"summary in {self.agent_id}'s memory."
+                f"summary in {self.agent_id}'s memory; comm_tokens={delta}."
             )
             return {
                 "success": True,
@@ -795,11 +802,16 @@ class BaseAgent:
                 "session_id": str(session_id),
             }
         except Exception as e:
+            delta = max(0, int(getattr(model, "token_usage", 0)) - before)
+            if not charged and delta:
+                self.token_usage += delta
+                self.comm_token_usage += delta
             # logger.exception() includes the full traceback so the real runtime
             # error (Cache/shape/dtype/OOM) is visible -- a silent failure here
             # makes the whole latent comm channel a no-op (communication_score=-1).
             self.logger.exception(
-                f"LATENT COMM FAILED ({self.agent_id}->{target_agent_id}): {e}"
+                f"LATENT COMM FAILED ({self.agent_id}->{target_agent_id}): {e}; "
+                f"comm_tokens_before_failure={delta}"
             )
             return {"success": False, "error-msg": f"latent communication failed: {e}"}
 
