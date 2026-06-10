@@ -118,6 +118,37 @@ def fmt(x: float) -> str:
     return f"{x:,.3f}"
 
 
+# --- token_breakdown helpers (engine writes summary_data["token_breakdown"]) ----
+BD_PREFIX = "token_breakdown."
+# Stage order for display; "total" last. communication is the one that differs
+# between graph and graph-latent, so it leads.
+BD_STAGES = ["communication", "agent_reasoning", "env_tools", "planner", "total"]
+BD_PARTS = ["communication", "agent_reasoning", "env_tools", "planner"]
+
+
+def breakdown_of(stats: dict) -> "dict[str, float]":
+    """Pull the token_breakdown.* means out of a file's stats (or {} if absent)."""
+    bd = {}
+    for stage in BD_STAGES:
+        key = BD_PREFIX + stage
+        if key in stats:
+            bd[stage] = stats[key][0]
+    return bd
+
+
+def bd_total(bd: "dict[str, float]") -> float:
+    """Total for percentages: the explicit 'total', else the sum of the parts."""
+    return bd.get("total") or sum(bd.get(p, 0.0) for p in BD_PARTS)
+
+
+def bd_cell(bd: "dict[str, float]", stage: str) -> str:
+    """`70,196 (20.3%)` for a stage, or `-` if this run has no breakdown."""
+    if stage not in bd:
+        return "-"
+    tot = bd_total(bd) or 1.0
+    return f"{bd[stage]:,.0f} ({100 * bd[stage] / tot:.1f}%)"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -140,18 +171,31 @@ def main() -> None:
         if not stats:
             print("  (no numeric metrics found)")
             continue
-        width = max(len(m) for m in stats)
-        for metric in sorted(stats):
-            m, n, miss = stats[metric]
-            miss_s = f", miss={miss}" if miss else ""
-            print(f"  {metric:<{width}}  mean={fmt(m)}  (n={n}{miss_s})")
+        # token_breakdown.* is shown in its own % block below, not as flat rows.
+        generic = {m: v for m, v in stats.items() if not m.startswith(BD_PREFIX)}
+        if generic:
+            width = max(len(m) for m in generic)
+            for metric in sorted(generic):
+                m, n, miss = generic[metric]
+                miss_s = f", miss={miss}" if miss else ""
+                print(f"  {metric:<{width}}  mean={fmt(m)}  (n={n}{miss_s})")
+        bd = breakdown_of(stats)
+        if bd:
+            tot = bd_total(bd) or 1.0
+            print("  token breakdown (mean tokens | % of total):")
+            sw = max(len(s) for s in bd)
+            for stage in BD_STAGES:
+                if stage in bd:
+                    print(f"    {stage:<{sw}}  {bd[stage]:>14,.0f}  {100 * bd[stage] / tot:5.1f}%")
 
     if len(columns) < 2:
         return
 
-    # Side-by-side comparison over the union of metrics.
+    # Side-by-side comparison over the union of metrics (breakdown shown below).
     print("\n=== comparison (mean) ===")
-    all_metrics = sorted({m for _, s in columns for m in s})
+    all_metrics = sorted(
+        {m for _, s in columns for m in s if not m.startswith(BD_PREFIX)}
+    )
     labels = [lbl for lbl, _ in columns]
     mwidth = max([len(m) for m in all_metrics] + [6])
     cwidth = max([len(l) for l in labels] + [9])
@@ -177,6 +221,27 @@ def main() -> None:
         print(row)
     if len(columns) == 2:
         print(f"\n  (delta = {labels[1]} - {labels[0]})")
+
+    # Dedicated token-breakdown comparison (mean tokens | % of total per column).
+    bds = [(lbl, breakdown_of(s)) for lbl, s in columns]
+    if any(bd for _, bd in bds):
+        print("\n=== token breakdown (mean tokens | % of total) ===")
+        cells_by_stage = {
+            st: [bd_cell(bd, st) for _, bd in bds] for st in BD_STAGES
+        }
+        swidth = max(len(s) for s in BD_STAGES)
+        cw = max([len(c) for cs in cells_by_stage.values() for c in cs] + [len(l) for l in labels])
+        print(f"  {'stage':<{swidth}}  " + "  ".join(f"{l:>{cw}}" for l in labels))
+        print("  " + "-" * (swidth + 2 + (cw + 2) * len(labels)))
+        for stage in BD_STAGES:
+            cells = "  ".join(f"{c:>{cw}}" for c in cells_by_stage[stage])
+            print(f"  {stage:<{swidth}}  {cells}")
+        missing = [lbl for lbl, bd in bds if not bd]
+        if missing:
+            print(
+                f"\n  note: no token_breakdown in: {', '.join(missing)} "
+                "(re-run with the current engine to get it)."
+            )
 
 
 if __name__ == "__main__":

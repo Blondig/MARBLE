@@ -70,5 +70,5 @@ class BaseMemory:
         Returns:
             str: String representation of the memory.
         """
-        memory_str = " ".join([json.dumps(info) for info in self.storage])
+        memory_str = " ".join([json.dumps(info, default=str) for info in self.storage])
         return memory_str

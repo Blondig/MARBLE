@@ -22,7 +22,9 @@ def convert_to_str(result: Any) -> str:
     if isinstance(result, bool):
         return str(result)  # Turn into 'True' or 'False'
     elif isinstance(result, dict):
-        return json.dumps(result)  # dict to JSON string
+        # default=str so non-JSON objects (e.g. a UUID session_id) degrade to their
+        # string form instead of raising -- a raise here aborts act() mid-way.
+        return json.dumps(result, default=str)  # dict to JSON string
     else:
         return str(result)  # handle other types
 
@@ -595,14 +597,17 @@ class BaseAgent:
           a speaker may END early: after both have spoken, a tiny plaintext control
           (``decode_bool``) decides whether to stop -- so this aligns the MAX turns
           and, like text, the actual turn count can be shorter.
-        - Each turn the speaker reasons in latent from ITS OWN profile + memory,
-          conditioned on the conversation SO FAR. Crucially the shared conversation
-          carries ONLY each speaker's latent CONTRIBUTION, never its raw prompt or
-          memory: a speaker's memory shapes only its own contribution, exactly like
-          the text baseline where one agent never directly consumes another's raw
-          memory. (Implementation: the shared-context KV is rebuilt each turn from
-          the contribution embeds only; the KV that consumed a speaker's private
-          prompt+memory is discarded.)
+        - Each speaker has a PRIVATE prefix KV, prefilled ONCE per session with its
+          system + profile + memory snapshot + task + topic. Per turn the speaker
+          only feeds a short instruction + ``latent_steps`` from its running KV, so
+          the fat (code-containing) memory is encoded once per speaker, not once per
+          turn (LatentMAS-sequential spirit: keep invariant context in KV, append
+          only new latent). The shared conversation carries ONLY each speaker's
+          latent CONTRIBUTION -- a speaker's raw prompt/memory NEVER enters the
+          peer's KV (privacy boundary, like the text baseline where one agent never
+          consumes another's raw memory). Each new contribution is appended to BOTH
+          speakers' running KVs; private prefixes stay separate (no single global
+          KV, which would leak A's memory to B).
         - After the turns, the INITIATOR decodes a summary into ITS OWN memory --
           the same landing point as the text path's final summary. The target's
           ``act()`` does not read the exchange, exactly as in graph.
@@ -654,55 +659,85 @@ class BaseAgent:
 
             # Alternating speakers, target first (mirrors text agents=[target, self]).
             speakers = [target, self]
-            contribs: List[Any] = []  # shared conversation: CONTRIBUTION embeds only
-            for t in range(n_turns):
-                speaker = speakers[t % 2]
-                other = speakers[(t + 1) % 2]
-                # Rebuild the shared-context KV from prior CONTRIBUTIONS only, so a
-                # speaker's private prompt+memory never leaks into the next speaker.
-                ctx_kv: Any = None
-                for c in contribs:
-                    ctx_kv = model.generate_latent_batch(
-                        inputs_embeds=c, latent_steps=0, past_key_values=ctx_kv
-                    )
-                turn_msg = [
-                    {"role": "system", "content": speaker.system_message},
+
+            # PER-SPEAKER PRIVATE PREFIX, prefilled ONCE per session with the
+            # session-invariant context: system + profile + memory snapshot + task +
+            # topic. This is the ONLY place the fat, code-containing memory is
+            # encoded -- once per speaker, not once per turn (old cost was ~5x the
+            # full prompt; now 2x). It is PRIVATE: a speaker's system/profile/memory
+            # never enters the peer's KV; only the latent CONTRIBUTION is shared.
+            running: "Dict[str, Any]" = {}
+            for i, sp in enumerate(speakers):
+                peer = speakers[(i + 1) % 2]
+                prefix_msg = [
+                    {"role": "system", "content": sp.system_message},
                     {
                         "role": "user",
                         "content": (
-                            f"You are {speaker.agent_id}: {speaker.get_profile()}\n"
-                            f"Your memory: {speaker.memory.get_memory_str()}\n"
+                            f"You are {sp.agent_id}: {sp.get_profile()}\n"
+                            f"Your memory: {sp.memory.get_memory_str()}\n"
                             f"Task: {task}\n"
-                            f"You are coordinating with {other.agent_id} on this topic: "
-                            f"{message}\n"
-                            "Reason about your contribution to advance the task."
+                            f"You are coordinating with {peer.agent_id} on this "
+                            f"topic: {message}"
                         ),
                     },
                 ]
-                _, ids, mask, _ = model.prepare_chat_batch([turn_msg])
-                # Reason on the speaker's OWN (private) prompt, conditioned on the
-                # shared contributions; the resulting KV (which absorbed the private
-                # prompt+memory) is discarded -- only the contribution is kept.
+                # add_generation_prompt=False: the prefix must NOT end with a
+                # dangling assistant header, or the per-turn user instruction would
+                # append after an empty assistant turn (malformed chat structure).
+                _, pids, pmask, _ = model.prepare_chat_batch(
+                    [prefix_msg], add_generation_prompt=False
+                )
+                running[sp.agent_id] = model.generate_latent_batch(
+                    pids, attention_mask=pmask, latent_steps=0, past_key_values=None
+                )
+
+            # The ONLY new text fed per turn (the full context already lives in the
+            # speaker's running KV) -- so each turn pays just instruction + steps.
+            _, instr_ids, instr_mask, _ = model.prepare_chat_batch(
+                [{
+                    "role": "user",
+                    "content": "Continue: add a brief latent contribution to advance the task.",
+                }]
+            )
+
+            # Each running[id] = its private prefix + ALL shared contributions so
+            # far -- a clean, symmetric contribution stream (no per-turn instruction
+            # text leaks into it). contribs is kept only for the final summary decode.
+            contribs: List[Any] = []
+            for t in range(n_turns):
+                speaker = speakers[t % 2]
+                other = speakers[(t + 1) % 2]
+                # Reason on a CHEAP shallow copy of the speaker's running KV + the
+                # short instruction; the copy (which now holds the instruction text)
+                # is discarded, so only the pure latent CONTRIBUTION survives.
+                # _copy_cache re-wraps the same tensors (no data copy); appends
+                # concatenate into new tensors, so running[speaker] is untouched.
+                spk_ctx = model._copy_cache(running[speaker.agent_id])
                 _, embeds = model.generate_latent_batch(
-                    ids,
-                    attention_mask=mask,
+                    instr_ids,
+                    attention_mask=instr_mask,
                     latent_steps=steps,
-                    past_key_values=ctx_kv,
+                    past_key_values=spk_ctx,
                     return_latent_embeds=True,
                 )
                 contribs.append(embeds)
+                # Append the PURE contribution to BOTH running KVs (shared stream);
+                # raw prompt/memory never crosses -- only the latent contribution.
+                for sid in (speaker.agent_id, other.agent_id):
+                    running[sid] = model.generate_latent_batch(
+                        inputs_embeds=embeds,
+                        latent_steps=0,
+                        past_key_values=running[sid],
+                    )
 
                 # Early stop, mirroring text's <end-of-session>: a tiny plaintext
-                # CONTROL decode (content stays latent) decides whether to stop.
-                # Allowed once both agents have spoken, and skipped on the last turn
-                # (the loop ends anyway). decode_bool copies the KV, so conditioning
-                # on the conversation-so-far does not mutate it.
+                # CONTROL decode conditioned on the speaker's running KV (decode_bool
+                # copies the KV, so it does not mutate it). Once both have spoken,
+                # and skipped on the last turn (the loop ends anyway).
                 if 2 <= t + 1 < n_turns:
-                    conv_kv = model.generate_latent_batch(
-                        inputs_embeds=embeds, latent_steps=0, past_key_values=ctx_kv
-                    )
                     if model.decode_bool(
-                        conv_kv,
+                        running[speaker.agent_id],
                         f"You are {speaker.agent_id}, coordinating with "
                         f"{other.agent_id}. Is this exchange resolved with nothing "
                         "useful left to add, so the session should end?",
@@ -757,7 +792,7 @@ class BaseAgent:
                 "full_chat_history": (
                     f"[latent {self.agent_id}<->{target_agent_id}] {briefing}"
                 ),
-                "session_id": session_id,
+                "session_id": str(session_id),
             }
         except Exception as e:
             # logger.exception() includes the full traceback so the real runtime
@@ -813,7 +848,7 @@ class BaseAgent:
             return {
                 "success": True,
                 "message": f"Successfully sent message to agent {target_agent_id}",
-                "session_id": session_id,
+                "session_id": str(session_id),
             }
 
         except Exception as e:
