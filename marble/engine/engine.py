@@ -452,6 +452,7 @@ class Engine:
                 "communication_score"
             ]
             summary_data["token_usage"] = self._get_totoal_token_usage()
+            summary_data["token_breakdown"] = self._token_breakdown()
             summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
             summary_data["total_milestones"] = self.evaluator.metrics[
                 "total_milestones"
@@ -608,6 +609,7 @@ class Engine:
                 "communication_score"
             ]
             summary_data["token_usage"] = self._get_totoal_token_usage()
+            summary_data["token_breakdown"] = self._token_breakdown()
             summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
             summary_data["total_milestones"] = self.evaluator.metrics[
                 "total_milestones"
@@ -782,6 +784,7 @@ class Engine:
                 "communication_score"
             ]
             summary_data["token_usage"] = self._get_totoal_token_usage()
+            summary_data["token_breakdown"] = self._token_breakdown()
             summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
             summary_data["total_milestones"] = self.evaluator.metrics[
                 "total_milestones"
@@ -904,6 +907,7 @@ class Engine:
                 "communication_score"
             ]
             summary_data["token_usage"] = self._get_totoal_token_usage()
+            summary_data["token_breakdown"] = self._token_breakdown()
             summary_data["agent_kpis"] = self.evaluator.metrics["agent_kpis"]
             summary_data["total_milestones"] = self.evaluator.metrics[
                 "total_milestones"
@@ -1647,3 +1651,34 @@ class Engine:
             + self.planner.token_usage
             + getattr(self.environment, "token_usage", 0)
         )
+
+    def _token_breakdown(self) -> Dict[str, int]:
+        """Per-stage split of the run's token budget, so a graph vs graph-latent
+        comparison shows where tokens actually go -- and how small the agent<->agent
+        communication slice is (the only thing latent comm can shave).
+
+        Sums to ``total``::
+
+            communication + agent_reasoning + planner + env_tools == total
+
+        - communication : agent<->agent channel (text chat OR latent), the only
+                          stage that differs between graph and graph-latent.
+        - agent_reasoning: agents' act()/plan_task LLM calls (everything charged to
+                          the agents except the communication subset).
+        - planner       : the standalone EnginePlanner (summarize/decide/plan-eval).
+        - env_tools     : LLM-backed env tools, e.g. coding create/revise -- usually
+                          the dominant chunk.
+
+        NOTE: the LLM JUDGE calls (evaluate_* in Evaluator) are NOT tracked in
+        token_usage at all, so they are not in this breakdown.
+        """
+        agents = self.graph.get_all_agents()
+        agents_total = sum(agent.token_usage for agent in agents)
+        communication = sum(getattr(a, "comm_token_usage", 0) for a in agents)
+        return {
+            "total": self._get_totoal_token_usage(),
+            "communication": communication,
+            "agent_reasoning": agents_total - communication,
+            "planner": self.planner.token_usage,
+            "env_tools": getattr(self.environment, "token_usage", 0),
+        }

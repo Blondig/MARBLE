@@ -85,6 +85,10 @@ class BaseAgent:
         self.logger = get_logger(self.__class__.__name__)
         self.logger.info(f"Agent '{self.agent_id}' initialized.")
         self.token_usage = 0
+        # Subset of token_usage spent specifically on the agent<->agent
+        # communication channel (text chat OR latent), so the engine can report a
+        # per-stage breakdown and show how small the comm slice actually is.
+        self.comm_token_usage = 0
         self.task_history: List[str] = []
         self.msg_box: Dict[str, Dict[str, List[Tuple[int, str]]]] = defaultdict(
             lambda: defaultdict(list)
@@ -428,10 +432,14 @@ class BaseAgent:
             return self._handle_latent_communication_session(
                 target_agent_id, message, session_id, task, turns
             )
+        # Track this text session's token cost so it can be reported separately
+        # (the whole chat + summary is charged to self.token_usage below).
+        comm_before = self.token_usage
         initial_communication = self._handle_communicate_to(
             target_agent_id, message, session_id
         )
         if not initial_communication["success"]:
+            self.comm_token_usage += max(0, self.token_usage - comm_before)
             return initial_communication
         assert (
             self.agent_graph is not None
@@ -555,6 +563,8 @@ class BaseAgent:
                 "result": result.content if result.content else "",
             },
         )
+        # Tag the whole text session's cost as communication for the breakdown.
+        self.comm_token_usage += max(0, self.token_usage - comm_before)
         return {
             "success": True,
             "message": f"Successfully completed session {session_id}",
@@ -610,6 +620,12 @@ class BaseAgent:
         NOT a verbatim multi-turn chat history. Read communication_score with that
         in mind (it is not directly comparable to the text full-chat score).
         """
+        # Entry log: printed the moment an agent CHOOSES to communicate, before any
+        # check or model call. Lets us tell apart "agents never call comm" (this
+        # line absent) from "comm called but handler failed" (this line + FAILED).
+        self.logger.info(
+            f"[latent comm] ENTER {self.agent_id} -> {target_agent_id}"
+        )
         model = self.latent_comm_model
         assert (
             self.agent_graph is not None
@@ -724,8 +740,11 @@ class BaseAgent:
                     "result": briefing,
                 },
             )
-            # Charge the white-box cost to the initiator so the engine total sees it.
-            self.token_usage += max(0, int(getattr(model, "token_usage", 0)) - before)
+            # Charge the white-box cost to the initiator so the engine total sees
+            # it, and tag it as communication for the per-stage breakdown.
+            delta = max(0, int(getattr(model, "token_usage", 0)) - before)
+            self.token_usage += delta
+            self.comm_token_usage += delta
 
             self.logger.info(
                 f"Agent {self.agent_id} ran latent comm with {target_agent_id} "
@@ -741,7 +760,12 @@ class BaseAgent:
                 "session_id": session_id,
             }
         except Exception as e:
-            self.logger.error(f"latent communication failed: {e}")
+            # logger.exception() includes the full traceback so the real runtime
+            # error (Cache/shape/dtype/OOM) is visible -- a silent failure here
+            # makes the whole latent comm channel a no-op (communication_score=-1).
+            self.logger.exception(
+                f"LATENT COMM FAILED ({self.agent_id}->{target_agent_id}): {e}"
+            )
             return {"success": False, "error-msg": f"latent communication failed: {e}"}
 
     def _handle_communicate_to(
