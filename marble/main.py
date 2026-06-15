@@ -75,6 +75,16 @@ def main() -> None:
             "max_new_tokens", int(os.environ.get("LATENT_MAX_NEW_TOKENS", "2048"))
         )
         latent.setdefault("device", os.environ.get("LATENT_DEVICE", "cuda"))
+        # Two independent switches (default: comm on, memory compression off).
+        latent.setdefault("latent_comm", os.environ.get("LATENT_COMM", "1") == "1")
+        latent.setdefault(
+            "latent_memory",
+            os.environ.get("LATENT_MEMORY", "0") == "1",
+        )
+        latent.setdefault(
+            "latent_memory_max_tokens",
+            int(os.environ.get("LATENT_MEMORY_MAX_TOKENS", "512")),
+        )
         config.latent = latent
         if isinstance(config.output, dict):
             config.output["file_path"] = os.environ.get(

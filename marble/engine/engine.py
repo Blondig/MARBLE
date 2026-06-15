@@ -1488,18 +1488,29 @@ class Engine:
             cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
         )
 
+        # Two independent switches. comm = latent agent<->agent communication;
+        # memory = latent compression of act()'s memory block. Tool selection,
+        # tool-call parsing, execution, planner, and plan_task stay text/MARBLE.
+        latent_comm_on = bool(cfg.get("latent_comm", True))
+        latent_memory_on = bool(cfg.get("latent_memory", False))
+        latent_memory_max_tokens = int(cfg.get("latent_memory_max_tokens", 512))
         self.logger.info(
-            f"[graph-latent] latent agent<->agent comm channel ON "
+            f"[graph-latent] latent_comm={latent_comm_on}, latent_memory={latent_memory_on} "
             f"(model={model_name}, latent_steps={latent_steps}, "
             f"comm_turns={latent_comm_turns or 'inherit text turns'}); "
-            "act()/tools/planner/scoring unchanged from the text graph."
+            "tool calls/planner/plan_task and graph pipeline unchanged."
         )
         model = ModelWrapper(model_name, device, latent_space_realign=realign)
         for agent in self.graph.get_all_agents():
-            agent.latent_comm_model = model
-            agent.latent_comm_steps = latent_steps
-            agent.latent_comm_turns = latent_comm_turns
-        # Reuse the text-graph pipeline verbatim; only the comm channel differs.
+            if latent_comm_on:
+                agent.latent_comm_model = model
+                agent.latent_comm_steps = latent_steps
+                agent.latent_comm_turns = latent_comm_turns
+            if latent_memory_on:
+                agent.latent_memory_model = model
+                agent.latent_memory_steps = latent_steps
+                agent.latent_memory_max_tokens = latent_memory_max_tokens
+        # Reuse the text-graph pipeline verbatim; only the gated seams differ.
         self.graph_coordinate()
 
     def start(self) -> None:
@@ -1654,17 +1665,19 @@ class Engine:
 
     def _token_breakdown(self) -> Dict[str, int]:
         """Per-stage split of the run's token budget, so a graph vs graph-latent
-        comparison shows where tokens actually go -- and how small the agent<->agent
-        communication slice is (the only thing latent comm can shave).
+        comparison shows where tokens actually go.
 
         Sums to ``total``::
 
-            communication + agent_reasoning + planner + env_tools == total
+            communication + memory_latent + agent_reasoning
+            + planner + env_tools == total
 
         - communication : agent<->agent channel (text chat OR latent), the only
                           stage that differs between graph and graph-latent.
+        - memory_latent : latent memory compression used to shorten act()'s memory
+                          block while preserving the original tool-call path.
         - agent_reasoning: agents' act()/plan_task LLM calls (everything charged to
-                          the agents except the communication subset).
+                          the agents except the communication/memory_latent subsets).
         - planner       : the standalone EnginePlanner (summarize/decide/plan-eval).
         - env_tools     : LLM-backed env tools, e.g. coding create/revise -- usually
                           the dominant chunk.
@@ -1675,10 +1688,16 @@ class Engine:
         agents = self.graph.get_all_agents()
         agents_total = sum(agent.token_usage for agent in agents)
         communication = sum(getattr(a, "comm_token_usage", 0) for a in agents)
+        memory_latent = sum(getattr(a, "memory_latent_token_usage", 0) for a in agents)
         return {
             "total": self._get_totoal_token_usage(),
             "communication": communication,
-            "agent_reasoning": agents_total - communication,
+            # latent memory compression used to shorten act()'s memory block; tool
+            # calls still go through the original text path.
+            "memory_latent": memory_latent,
+            # residual = original text agent calls (act() tool decisions + plan_task)
+            # after subtracting communication and latent memory compression.
+            "agent_reasoning": agents_total - communication - memory_latent,
             "planner": self.planner.token_usage,
             "env_tools": getattr(self.environment, "token_usage", 0),
         }

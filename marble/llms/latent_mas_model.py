@@ -147,6 +147,7 @@ class ModelWrapper:
         the latent arm runs thinking-off too (fair text-vs-latent comparison, and
         the bridge emits the answer directly instead of a budget-eating think).
         Pass enable_thinking=None to fall back to the template default.
+
         """
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
@@ -162,7 +163,9 @@ class ModelWrapper:
                     # Template does not accept enable_thinking (non-Qwen3 models).
                     pass
             return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=add_generation_prompt
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
             )
         segments = []
         for message in messages:

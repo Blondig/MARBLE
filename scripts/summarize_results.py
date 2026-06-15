@@ -122,8 +122,15 @@ def fmt(x: float) -> str:
 BD_PREFIX = "token_breakdown."
 # Stage order for display; "total" last. communication is the one that differs
 # between graph and graph-latent, so it leads.
-BD_STAGES = ["communication", "agent_reasoning", "env_tools", "planner", "total"]
-BD_PARTS = ["communication", "agent_reasoning", "env_tools", "planner"]
+BD_STAGES = [
+    "communication",
+    "memory_latent",
+    "agent_reasoning",
+    "env_tools",
+    "planner",
+    "total",
+]
+BD_PARTS = ["communication", "memory_latent", "agent_reasoning", "env_tools", "planner"]
 
 
 def breakdown_of(stats: dict) -> "dict[str, float]":

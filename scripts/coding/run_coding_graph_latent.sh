@@ -19,11 +19,20 @@ export OPENAI_API_BASE="${OPENAI_API_BASE:-http://localhost:9999/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 export GRAPH_LATENT=1
 export LATENT_STEPS="${LATENT_STEPS:-10}"
-export LATENT_OUTPUT="result/coding_graph_latent_steps${LATENT_STEPS}.jsonl"
+# Tag outputs by which switches are on, so memory-compressed / comm-only runs
+# don't mix into the same jsonl/solution dir. LATENT_MEMORY=1 enables latent
+# memory compression for act(). LATENT_COMM defaults on (set LATENT_COMM=0 to
+# isolate memory-only).
+_TAG=""
+if [ "${LATENT_MEMORY:-0}" = "1" ]; then
+    _TAG="${_TAG}_memory"
+fi
+[ "${LATENT_COMM:-1}" = "0" ] && _TAG="${_TAG}_nocomm"
+export LATENT_OUTPUT="result/coding_graph_latent_steps${LATENT_STEPS}${_TAG}.jsonl"
 
 WORKSPACE_DIR="workspace"
 CONFIG_DIR="marble/configs/coding_configs"
-SOLU_DIR="marble/logs/qwen3-8b/coding_latent_steps${LATENT_STEPS}"
+SOLU_DIR="marble/logs/qwen3-8b/coding_latent_steps${LATENT_STEPS}${_TAG}"
 N="${1:-100}"
 
 mkdir -p "${WORKSPACE_DIR}" "${SOLU_DIR}" result

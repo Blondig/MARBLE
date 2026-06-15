@@ -83,6 +83,15 @@ class BaseAgent:
         # None => inherit the text session's `turns` (so the latent exchange runs
         # the SAME number of turns as the baseline); set only to OVERRIDE it.
         self.latent_comm_turns: Optional[int] = None
+        # graph-latent memory compression: when attached, act() still uses the
+        # original MARBLE tool-call path, but the large cross-round memory block is
+        # replaced by a short context decoded from this agent's latent memory KV.
+        self.latent_memory_model: Any = None
+        self.latent_memory_steps: int = 10
+        self.latent_memory_max_tokens: int = 512
+        self._memory_kv: Any = None
+        self._memory_seen: int = 0
+        self.memory_latent_token_usage = 0
         self.relationships: Dict[str, str] = {}
         self.logger = get_logger(self.__class__.__name__)
         self.logger.info(f"Agent '{self.agent_id}' initialized.")
@@ -153,76 +162,9 @@ class BaseAgent:
         """
         self.task_history.append(task)
         self.logger.info(f"Agent '{self.agent_id}' acting on task '{task}'.")
-        tools = [
-            self.env.action_handler_descriptions[name]
-            for name in self.env.action_handler_descriptions
-        ]
-        available_agents: Dict[str, Any] = {}
-        assert (
-            self.agent_graph is not None
-        ), "Agent graph is not set. Please set the agent graph using the set_agent_graph method first."
-        for agent_id_1, agent_id_2, relationship in self.agent_graph.relationships:
-            if agent_id_1 != self.agent_id and agent_id_2 != self.agent_id:
-                continue
-            else:
-                if agent_id_1 == self.agent_id:
-                    profile = self.agent_graph.agents[agent_id_2].get_profile()
-                    agent_id = agent_id_2
-                elif agent_id_2 == self.agent_id:
-                    profile = self.agent_graph.agents[agent_id_1].get_profile()
-                    agent_id = agent_id_1
-                available_agents[agent_id] = {
-                    "profile": profile,
-                    "role": f"{agent_id_1} {relationship} {agent_id_2}",
-                }
-        self.available_agents = available_agents
-        # Create the enum description with detailed information about each agent
-        agent_descriptions = [
-            f"{agent_id} ({info['role']} - {info['profile']})"
-            for agent_id, info in available_agents.items()
-        ]
-        # Add communicate_to function description
-        new_communication_session_description = {
-            "type": "function",
-            "function": {
-                "name": "new_communication_session",
-                "description": "Send a message to a specific target agent based on existing relationships, and begin communication",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target_agent_id": {
-                            "type": "string",
-                            "description": "The ID of the target agent to communicate with. Available agents:\n"
-                            + "\n".join([f"- {desc}" for desc in agent_descriptions]),
-                            "enum": list(
-                                self.relationships.keys()
-                            ),  # Dynamically list available target agents
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "The initial message to send to the target agent",
-                        },
-                    },
-                    "required": ["target_agent_id", "message"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-        tools.append(new_communication_session_description)
-        reasoning_prompt = self.reasoning_prompts.get(self.strategy, "")
-        self.logger.info(
-            f"Agent {self.agent_id} using {self.strategy} strategy with prompt:\n{reasoning_prompt}"
-        )
-
-        act_task = (
-            f"You are {self.agent_id}: {self.profile}\n"
-            f"{reasoning_prompt}\n"  # 使用已经获取的 reasoning_prompt
-            f"This is your task: {task}\n"
-            f"These are the ids and profiles of other agents you can interact with:\n"
-            f"{agent_descriptions}"
-            f"But you do not have to communcate with other agents.\n"
-            f"You can also solve the task by calling other functions to solve it by yourself.\n"
-            f"These are your memory: {self.memory.get_memory_str()}\n"
+        memory_context = self._get_latent_memory_context_or_none(task)
+        act_task, tools = self._build_act_context(
+            task, memory_context=memory_context
         )
         self.logger.info(f"Complete prompt for agent {self.agent_id}:\n{act_task}")
 
@@ -309,6 +251,177 @@ class BaseAgent:
         if result_from_function_str:
             output += "Result from the function:" + result_from_function_str
         return output, communication
+
+    def _build_act_context(
+        self, task: str, *, memory_context: Optional[str] = None
+    ) -> "Tuple[str, List[Dict[str, Any]]]":
+        """Build act()'s original MARBLE prompt + tool schema.
+
+        ``memory_context=None`` preserves the original behavior and inlines
+        ``self.memory.get_memory_str()``. When latent memory compression is enabled,
+        ``memory_context`` is a short decoded summary; the downstream tool decision
+        still uses the original ``model_prompting(..., tools=..., tool_choice="auto")``
+        path.
+        """
+        tools = [
+            self.env.action_handler_descriptions[name]
+            for name in self.env.action_handler_descriptions
+        ]
+        available_agents: Dict[str, Any] = {}
+        assert (
+            self.agent_graph is not None
+        ), "Agent graph is not set. Please set the agent graph using the set_agent_graph method first."
+        for agent_id_1, agent_id_2, relationship in self.agent_graph.relationships:
+            if agent_id_1 != self.agent_id and agent_id_2 != self.agent_id:
+                continue
+            if agent_id_1 == self.agent_id:
+                profile = self.agent_graph.agents[agent_id_2].get_profile()
+                agent_id = agent_id_2
+            elif agent_id_2 == self.agent_id:
+                profile = self.agent_graph.agents[agent_id_1].get_profile()
+                agent_id = agent_id_1
+            available_agents[agent_id] = {
+                "profile": profile,
+                "role": f"{agent_id_1} {relationship} {agent_id_2}",
+            }
+        self.available_agents = available_agents
+        agent_descriptions = [
+            f"{agent_id} ({info['role']} - {info['profile']})"
+            for agent_id, info in available_agents.items()
+        ]
+        new_communication_session_description = {
+            "type": "function",
+            "function": {
+                "name": "new_communication_session",
+                "description": "Send a message to a specific target agent based on existing relationships, and begin communication",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target_agent_id": {
+                            "type": "string",
+                            "description": "The ID of the target agent to communicate with. Available agents:\n"
+                            + "\n".join([f"- {desc}" for desc in agent_descriptions]),
+                            "enum": list(self.relationships.keys()),
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "The initial message to send to the target agent",
+                        },
+                    },
+                    "required": ["target_agent_id", "message"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        tools.append(new_communication_session_description)
+        reasoning_prompt = self.reasoning_prompts.get(self.strategy, "")
+        memory_text = (
+            self.memory.get_memory_str()
+            if memory_context is None
+            else memory_context
+        )
+        act_task = (
+            f"You are {self.agent_id}: {self.profile}\n"
+            f"{reasoning_prompt}\n"
+            f"This is your task: {task}\n"
+            f"These are the ids and profiles of other agents you can interact with:\n"
+            f"{agent_descriptions}"
+            f"But you do not have to communcate with other agents.\n"
+            f"You can also solve the task by calling other functions to solve it by yourself.\n"
+            f"These are your memory: {memory_text}\n"
+        )
+        return act_task, tools
+
+    def _sync_latent_memory_kv(self, model: Any) -> int:
+        """Append newly stored memory entries into this agent's latent memory KV.
+
+        Memory deltas are appended once, then followed by ``latent_memory_steps``
+        latent positions so later short-context decoding can attend both the raw
+        delta and the latent working state. Returns the number of newly appended
+        memory entries.
+        """
+        storage = getattr(self.memory, "storage", [])
+        start = int(getattr(self, "_memory_seen", 0))
+        if start >= len(storage):
+            return 0
+        new_items = storage[start:]
+        delta_text = "\n".join(
+            json.dumps(item, default=str) for item in new_items
+        )
+        if not delta_text.strip():
+            self._memory_seen = len(storage)
+            return 0
+        msgs = [
+            {
+                "role": "user",
+                "content": (
+                    "Append these new memory entries to your working memory:\n"
+                    f"{delta_text}"
+                ),
+            }
+        ]
+        _, ids, mask, _ = model.prepare_chat_batch([msgs], add_generation_prompt=False)
+        self._memory_kv = model.generate_latent_batch(
+            ids,
+            attention_mask=mask,
+            latent_steps=int(getattr(self, "latent_memory_steps", 10)),
+            past_key_values=self._memory_kv,
+        )
+        self._memory_seen = len(storage)
+        return len(new_items)
+
+    def _get_latent_memory_context_or_none(self, task: str) -> Optional[str]:
+        """Decode a short memory context for act(), without changing tool calling.
+
+        The returned text replaces the full ``memory.get_memory_str()`` inside the
+        original MARBLE act prompt. If latent memory is disabled or fails, return
+        ``None`` so act() falls back to the exact full-memory prompt.
+        """
+        model = getattr(self, "latent_memory_model", None)
+        if model is None:
+            return None
+        before = int(getattr(model, "token_usage", 0))
+        try:
+            appended = self._sync_latent_memory_kv(model)
+            if self._memory_kv is None:
+                return ""
+            instruction = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize the memory entries above into a concise working "
+                        "memory for the next MARBLE act() tool decision. Preserve "
+                        "task-relevant facts, completed actions, file paths, code "
+                        "or review outcomes, communication results, and constraints. "
+                        f"Current task: {task}\n"
+                        "Do not invent details. Output plain text only."
+                    ),
+                }
+            ]
+            _, ids, mask, _ = model.prepare_chat_batch([instruction])
+            context_list, _ = model.generate_text_batch(
+                ids,
+                mask,
+                max_new_tokens=int(getattr(self, "latent_memory_max_tokens", 512)),
+                temperature=0.2,
+                top_p=0.95,
+                past_key_values=model._copy_cache(self._memory_kv),
+            )
+            context = context_list[0].strip() if context_list else ""
+            delta = max(0, int(getattr(model, "token_usage", 0)) - before)
+            self.token_usage += delta
+            self.memory_latent_token_usage += delta
+            self.logger.info(
+                f"[latent memory] {self.agent_id}: appended={appended}, "
+                f"context_chars={len(context)}, tokens={delta}"
+            )
+            return context
+        except Exception as e:
+            self.logger.exception(
+                f"latent memory compression FAILED ({self.agent_id}); "
+                f"falling back to full memory: {e}"
+            )
+            return None
 
     def _calculate_token_usage(self, task: str, result: str) -> int:
         """
