@@ -1689,15 +1689,35 @@ class Engine:
         agents_total = sum(agent.token_usage for agent in agents)
         communication = sum(getattr(a, "comm_token_usage", 0) for a in agents)
         memory_latent = sum(getattr(a, "memory_latent_token_usage", 0) for a in agents)
+        memory_encode = sum(getattr(a, "memory_encode_token_usage", 0) for a in agents)
+        memory_decode = sum(getattr(a, "memory_decode_token_usage", 0) for a in agents)
         return {
             "total": self._get_totoal_token_usage(),
             "communication": communication,
             # latent memory compression used to shorten act()'s memory block; tool
-            # calls still go through the original text path.
+            # calls still go through the original text path. memory_latent = encode
+            # (writing deltas into the KV) + decode (the per-act short context).
             "memory_latent": memory_latent,
+            "memory_encode": memory_encode,
+            "memory_decode": memory_decode,
             # residual = original text agent calls (act() tool decisions + plan_task)
             # after subtracting communication and latent memory compression.
             "agent_reasoning": agents_total - communication - memory_latent,
             "planner": self.planner.token_usage,
             "env_tools": getattr(self.environment, "token_usage", 0),
+            # Diagnostic split of the act() prompt (subdivides agent_reasoning; the
+            # first five are inside it, act_tool_schema is the tools= schema that is
+            # NOT counted in agent_reasoning -- the previously-invisible cost).
+            "act_profile": sum(getattr(a, "act_profile_tokens", 0) for a in agents),
+            "act_fixed": sum(getattr(a, "act_fixed_tokens", 0) for a in agents),
+            "act_task": sum(getattr(a, "act_task_tokens", 0) for a in agents),
+            "act_agents": sum(getattr(a, "act_agents_tokens", 0) for a in agents),
+            "act_memory_ctx": sum(getattr(a, "act_memory_ctx_tokens", 0) for a in agents),
+            "act_tool_schema": sum(getattr(a, "act_tool_schema_tokens", 0) for a in agents),
+            # plan_task split (also inside agent_reasoning; uses FULL memory).
+            "plan_task": sum(getattr(a, "plan_task_tokens", 0) for a in agents),
+            "plan_task_memory": sum(getattr(a, "plan_task_memory_tokens", 0) for a in agents),
+            "plan_task_history": sum(getattr(a, "plan_task_history_tokens", 0) for a in agents),
+            "plan_task_profile": sum(getattr(a, "plan_task_profile_tokens", 0) for a in agents),
+            "plan_task_fixed": sum(getattr(a, "plan_task_fixed_tokens", 0) for a in agents),
         }

@@ -91,7 +91,27 @@ class BaseAgent:
         self.latent_memory_max_tokens: int = 512
         self._memory_kv: Any = None
         self._memory_seen: int = 0
-        self.memory_latent_token_usage = 0
+        self.memory_latent_token_usage = 0  # = memory_encode + memory_decode
+        self.memory_encode_token_usage = 0  # writing new memory deltas into the KV
+        self.memory_decode_token_usage = 0  # decoding the short context each act()
+        # Diagnostic per-component split of the act() prompt (NOT extra cost: the
+        # first five subdivide what agent_reasoning already counts; act_tool_schema
+        # is the tools= schema that token_counter on messages does NOT count -- so
+        # we can see where agent_reasoning actually goes, esp. the invisible tools).
+        self.act_profile_tokens = 0
+        self.act_fixed_tokens = 0
+        self.act_task_tokens = 0
+        self.act_agents_tokens = 0
+        self.act_memory_ctx_tokens = 0
+        self.act_tool_schema_tokens = 0
+        # Diagnostic split of plan_task()'s prompt (also inside agent_reasoning).
+        # plan_task still uses FULL memory (uncompressed), so this shows whether it
+        # is the largest remaining unoptimized block.
+        self.plan_task_tokens = 0
+        self.plan_task_memory_tokens = 0
+        self.plan_task_history_tokens = 0
+        self.plan_task_profile_tokens = 0
+        self.plan_task_fixed_tokens = 0
         self.relationships: Dict[str, str] = {}
         self.logger = get_logger(self.__class__.__name__)
         self.logger.info(f"Agent '{self.agent_id}' initialized.")
@@ -330,6 +350,30 @@ class BaseAgent:
             f"You can also solve the task by calling other functions to solve it by yourself.\n"
             f"These are your memory: {memory_text}\n"
         )
+
+        # Diagnostic: split act_task into components (+ the tools= schema, which
+        # token_counter on messages does NOT include). Approximate (per-piece
+        # tokenization), for seeing where agent_reasoning goes -- does not change
+        # token_usage. fixed = act_task minus the variable pieces (labels +
+        # reasoning_prompt + boilerplate).
+        def _ct(text: Any) -> int:
+            try:
+                return token_counter(
+                    model=self.llm, messages=[{"role": "user", "content": str(text)}]
+                )
+            except Exception:
+                return 0
+
+        prof = _ct(self.profile)
+        tsk = _ct(task)
+        agts = _ct(agent_descriptions)
+        memc = _ct(memory_text)
+        self.act_profile_tokens += prof
+        self.act_task_tokens += tsk
+        self.act_agents_tokens += agts
+        self.act_memory_ctx_tokens += memc
+        self.act_tool_schema_tokens += _ct(json.dumps(tools, default=str))
+        self.act_fixed_tokens += max(0, _ct(act_task) - prof - tsk - agts - memc)
         return act_task, tools
 
     def _sync_latent_memory_kv(self, model: Any) -> int:
@@ -382,8 +426,13 @@ class BaseAgent:
             return None
         before = int(getattr(model, "token_usage", 0))
         try:
+            # (a) ENCODE: append new memory deltas (+ latent steps) into the KV.
             appended = self._sync_latent_memory_kv(model)
+            encode_delta = max(0, int(getattr(model, "token_usage", 0)) - before)
             if self._memory_kv is None:
+                self.token_usage += encode_delta
+                self.memory_encode_token_usage += encode_delta
+                self.memory_latent_token_usage += encode_delta
                 return ""
             instruction = [
                 {
@@ -399,6 +448,8 @@ class BaseAgent:
                 }
             ]
             _, ids, mask, _ = model.prepare_chat_batch([instruction])
+            # (b) DECODE: decode the short working-memory context from the KV.
+            dec_before = int(getattr(model, "token_usage", 0))
             context_list, _ = model.generate_text_batch(
                 ids,
                 mask,
@@ -407,13 +458,22 @@ class BaseAgent:
                 top_p=0.95,
                 past_key_values=model._copy_cache(self._memory_kv),
             )
+            decode_delta = max(0, int(getattr(model, "token_usage", 0)) - dec_before)
             context = context_list[0].strip() if context_list else ""
-            delta = max(0, int(getattr(model, "token_usage", 0)) - before)
-            self.token_usage += delta
-            self.memory_latent_token_usage += delta
+            self.token_usage += encode_delta + decode_delta
+            self.memory_encode_token_usage += encode_delta
+            self.memory_decode_token_usage += decode_delta
+            self.memory_latent_token_usage += encode_delta + decode_delta
+            # How many tokens the decoded context ADDS to the act() vLLM prompt
+            # (vs the full memory it replaces) -- log so we can see prompt savings.
+            try:
+                ctx_tokens = int(model.tokenize_text(context).shape[-1]) if context else 0
+            except Exception:
+                ctx_tokens = 0
             self.logger.info(
                 f"[latent memory] {self.agent_id}: appended={appended}, "
-                f"context_chars={len(context)}, tokens={delta}"
+                f"encode_tok={encode_delta}, decode_tok={decode_delta}, "
+                f"ctx_chars={len(context)}, ctx_tokens={ctx_tokens}"
             )
             return context
         except Exception as e:
@@ -1018,12 +1078,34 @@ class BaseAgent:
             },
             {"role": "system", "content": next_task},
         ]
-        self.token_usage += token_counter(model=self.llm, messages=messages)
+        pt = token_counter(model=self.llm, messages=messages)
+        self.token_usage += pt
+        # Diagnostic split of plan_task (prompt + response). memory uses the FULL
+        # memory_str (uncompressed); fixed = remainder (boilerplate + response).
+        mem_t = self._count_tokens(memory_str)
+        hist_t = self._count_tokens(task_history_str)
+        prof_t = self._count_tokens(persona)
+        self.plan_task_tokens += pt
+        self.plan_task_memory_tokens += mem_t
+        self.plan_task_history_tokens += hist_t
+        self.plan_task_profile_tokens += prof_t
+        self.plan_task_fixed_tokens += max(0, pt - mem_t - hist_t - prof_t)
         self.logger.info(
             f"Agent '{self.agent_id}' plans next task based on persona: {next_task}"
         )
 
         return next_task
+
+    def _count_tokens(self, text: Any) -> int:
+        """Token count for one text piece (diagnostic breakdowns). Approximate:
+        each piece is wrapped as a message, so pieces won't sum exactly to a full
+        prompt's count -- fine for spotting the big contributors."""
+        try:
+            return token_counter(
+                model=self.llm, messages=[{"role": "user", "content": str(text)}]
+            )
+        except Exception:
+            return 0
 
     def _is_task_completed(self, result: Any) -> bool:
         """

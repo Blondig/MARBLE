@@ -125,11 +125,29 @@ BD_PREFIX = "token_breakdown."
 BD_STAGES = [
     "communication",
     "memory_latent",
+    "memory_encode",  # sub-split of memory_latent (display only, not a separate part)
+    "memory_decode",  # sub-split of memory_latent (display only, not a separate part)
     "agent_reasoning",
+    # sub-split of agent_reasoning's act() prompt (display only). act_tool_schema is
+    # the tools= schema NOT counted in agent_reasoning (the previously-invisible cost).
+    "act_profile",
+    "act_fixed",
+    "act_task",
+    "act_agents",
+    "act_memory_ctx",
+    "act_tool_schema",
+    # plan_task split (also inside agent_reasoning; plan_task still uses FULL memory).
+    "plan_task",
+    "plan_task_memory",
+    "plan_task_history",
+    "plan_task_profile",
+    "plan_task_fixed",
     "env_tools",
     "planner",
     "total",
 ]
+# memory_encode/decode are NOT in PARTS: they already sum into memory_latent, so
+# including them would double-count the fallback total.
 BD_PARTS = ["communication", "memory_latent", "agent_reasoning", "env_tools", "planner"]
 
 
