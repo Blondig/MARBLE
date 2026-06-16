@@ -25,7 +25,8 @@ export LATENT_STEPS="${LATENT_STEPS:-10}"
 # isolate memory-only).
 _TAG=""
 if [ "${LATENT_MEMORY:-0}" = "1" ]; then
-    _TAG="${_TAG}_memory"
+    # include the memory budget so e.g. _memory512 vs _memory256 don't collide
+    _TAG="${_TAG}_memory${LATENT_MEMORY_MAX_TOKENS:-512}"
 fi
 [ "${LATENT_COMM:-1}" = "0" ] && _TAG="${_TAG}_nocomm"
 export LATENT_OUTPUT="result/coding_graph_latent_steps${LATENT_STEPS}${_TAG}.jsonl"
