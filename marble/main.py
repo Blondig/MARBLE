@@ -82,6 +82,10 @@ def main() -> None:
             os.environ.get("LATENT_MEMORY", "0") == "1",
         )
         latent.setdefault(
+            "latent_memory_plan",
+            os.environ.get("LATENT_MEMORY_PLAN", "0") == "1",
+        )
+        latent.setdefault(
             "latent_memory_max_tokens",
             int(os.environ.get("LATENT_MEMORY_MAX_TOKENS", "512")),
         )

@@ -136,7 +136,8 @@ BD_STAGES = [
     "act_agents",
     "act_memory_ctx",
     "act_tool_schema",
-    # plan_task split (also inside agent_reasoning; plan_task still uses FULL memory).
+    # plan_task split (also inside agent_reasoning; FULL memory, or compressed when
+    # LATENT_MEMORY_PLAN=1 -- then plan_task_memory drops like act_memory_ctx).
     "plan_task",
     "plan_task_memory",
     "plan_task_history",

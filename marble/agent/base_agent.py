@@ -83,14 +83,22 @@ class BaseAgent:
         # None => inherit the text session's `turns` (so the latent exchange runs
         # the SAME number of turns as the baseline); set only to OVERRIDE it.
         self.latent_comm_turns: Optional[int] = None
-        # graph-latent memory compression: when attached, act() still uses the
-        # original MARBLE tool-call path, but the large cross-round memory block is
-        # replaced by a short context decoded from this agent's latent memory KV.
+        # graph-latent memory compression: when attached, the tool-call path stays
+        # the original MARBLE one, but the large cross-round memory block in act()
+        # and/or plan_task() is replaced by a short context decoded from this agent's
+        # latent memory KV (gated by latent_memory_act / latent_memory_plan).
         self.latent_memory_model: Any = None
         self.latent_memory_steps: int = 10
         self.latent_memory_max_tokens: int = 512
+        # Independent switches: compress act()'s memory and/or plan_task()'s memory.
+        self.latent_memory_act: bool = False
+        self.latent_memory_plan: bool = False
         self._memory_kv: Any = None
         self._memory_seen: int = 0
+        # Per-round decoded-context cache so plan_task() and act() in the SAME round
+        # share ONE decode (avoid double-decoding). Invalidated when memory grows.
+        self._memory_ctx_cache: Optional[str] = None
+        self._memory_ctx_len: int = -1
         self.memory_latent_token_usage = 0  # = memory_encode + memory_decode
         self.memory_encode_token_usage = 0  # writing new memory deltas into the KV
         self.memory_decode_token_usage = 0  # decoding the short context each act()
@@ -105,8 +113,8 @@ class BaseAgent:
         self.act_memory_ctx_tokens = 0
         self.act_tool_schema_tokens = 0
         # Diagnostic split of plan_task()'s prompt (also inside agent_reasoning).
-        # plan_task still uses FULL memory (uncompressed), so this shows whether it
-        # is the largest remaining unoptimized block.
+        # plan_task uses FULL memory by default (or the compressed context when
+        # latent_memory_plan is on), so this shows its share of agent_reasoning.
         self.plan_task_tokens = 0
         self.plan_task_memory_tokens = 0
         self.plan_task_history_tokens = 0
@@ -182,7 +190,11 @@ class BaseAgent:
         """
         self.task_history.append(task)
         self.logger.info(f"Agent '{self.agent_id}' acting on task '{task}'.")
-        memory_context = self._get_latent_memory_context_or_none(task)
+        memory_context = (
+            self._get_latent_memory_context_or_none()
+            if self.latent_memory_act
+            else None
+        )
         act_task, tools = self._build_act_context(
             task, memory_context=memory_context
         )
@@ -414,16 +426,25 @@ class BaseAgent:
         self._memory_seen = len(storage)
         return len(new_items)
 
-    def _get_latent_memory_context_or_none(self, task: str) -> Optional[str]:
-        """Decode a short memory context for act(), without changing tool calling.
+    def _get_latent_memory_context_or_none(self) -> Optional[str]:
+        """Decode a short, TASK-AGNOSTIC working-memory context that replaces the
+        full ``memory.get_memory_str()`` in act() and/or plan_task() (tool calling
+        unchanged). Returns ``None`` if latent memory is disabled or fails, so the
+        caller falls back to full memory.
 
-        The returned text replaces the full ``memory.get_memory_str()`` inside the
-        original MARBLE act prompt. If latent memory is disabled or fails, return
-        ``None`` so act() falls back to the exact full-memory prompt.
+        Task-agnostic by design: the original MARBLE memory is NOT rewritten per
+        task (the task appears elsewhere in the act/plan prompt), so we compress the
+        SAME agent memory both calls see. That makes the per-round cache key just the
+        memory size: plan_task() (runs first, doesn't write memory) and act() (same
+        round) reuse ONE decode; the cache invalidates automatically when memory
+        grows next round.
         """
         model = getattr(self, "latent_memory_model", None)
         if model is None:
             return None
+        cur_len = len(getattr(self.memory, "storage", []))
+        if self._memory_ctx_cache is not None and self._memory_ctx_len == cur_len:
+            return self._memory_ctx_cache  # reuse this round's decode (no re-charge)
         before = int(getattr(model, "token_usage", 0))
         try:
             # (a) ENCODE: append new memory deltas (+ latent steps) into the KV.
@@ -433,16 +454,18 @@ class BaseAgent:
                 self.token_usage += encode_delta
                 self.memory_encode_token_usage += encode_delta
                 self.memory_latent_token_usage += encode_delta
+                self._memory_ctx_cache = ""
+                self._memory_ctx_len = cur_len
                 return ""
             instruction = [
                 {
                     "role": "user",
                     "content": (
                         "Summarize the memory entries above into a concise working "
-                        "memory for the next MARBLE act() tool decision. Preserve "
-                        "task-relevant facts, completed actions, file paths, code "
-                        "or review outcomes, communication results, and constraints. "
-                        f"Current task: {task}\n"
+                        "memory for this agent's next decision (used by both task "
+                        "planning and tool selection). Preserve task-relevant facts, "
+                        "completed actions, file paths, code or review outcomes, "
+                        "communication results, and constraints. "
                         "Do not invent details. Output plain text only."
                     ),
                 }
@@ -475,6 +498,8 @@ class BaseAgent:
                 f"encode_tok={encode_delta}, decode_tok={decode_delta}, "
                 f"ctx_chars={len(context)}, ctx_tokens={ctx_tokens}"
             )
+            self._memory_ctx_cache = context
+            self._memory_ctx_len = cur_len
             return context
         except Exception as e:
             self.logger.exception(
@@ -1049,8 +1074,15 @@ class BaseAgent:
         """
         self.logger.info(f"Agent '{self.agent_id}' is planning the next task.")
 
-        # Retrieve all memory entries for this agent
-        memory_str = self.memory.get_memory_str()
+        # Retrieve memory: full by default, or the SAME latent-compressed context
+        # act() uses when the plan switch is on (task-agnostic; shares the same-round
+        # decode via the cache, mirroring the original where act/plan see one memory).
+        mem_ctx = (
+            self._get_latent_memory_context_or_none()
+            if self.latent_memory_plan
+            else None
+        )
+        memory_str = self.memory.get_memory_str() if mem_ctx is None else mem_ctx
         task_history_str = ", ".join(self.task_history)
 
         # Incorporate agent's profile/persona in decision making

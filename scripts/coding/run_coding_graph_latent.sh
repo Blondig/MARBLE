@@ -28,6 +28,15 @@ if [ "${LATENT_MEMORY:-0}" = "1" ]; then
     # include the memory budget so e.g. _memory512 vs _memory256 don't collide
     _TAG="${_TAG}_memory${LATENT_MEMORY_MAX_TOKENS:-512}"
 fi
+# plan_task memory compression (independent switch). On its own (act memory off),
+# still tag the budget so plan-only runs are distinguishable.
+if [ "${LATENT_MEMORY_PLAN:-0}" = "1" ]; then
+    if [ "${LATENT_MEMORY:-0}" = "1" ]; then
+        _TAG="${_TAG}_plan"
+    else
+        _TAG="${_TAG}_plan${LATENT_MEMORY_MAX_TOKENS:-512}"
+    fi
+fi
 [ "${LATENT_COMM:-1}" = "0" ] && _TAG="${_TAG}_nocomm"
 export LATENT_OUTPUT="result/coding_graph_latent_steps${LATENT_STEPS}${_TAG}.jsonl"
 

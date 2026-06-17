@@ -1492,13 +1492,15 @@ class Engine:
         # memory = latent compression of act()'s memory block. Tool selection,
         # tool-call parsing, execution, planner, and plan_task stay text/MARBLE.
         latent_comm_on = bool(cfg.get("latent_comm", True))
-        latent_memory_on = bool(cfg.get("latent_memory", False))
+        latent_memory_on = bool(cfg.get("latent_memory", False))  # compress act() memory
+        latent_memory_plan_on = bool(cfg.get("latent_memory_plan", False))  # compress plan_task memory
         latent_memory_max_tokens = int(cfg.get("latent_memory_max_tokens", 512))
         self.logger.info(
-            f"[graph-latent] latent_comm={latent_comm_on}, latent_memory={latent_memory_on} "
+            f"[graph-latent] latent_comm={latent_comm_on}, latent_memory={latent_memory_on}, "
+            f"latent_memory_plan={latent_memory_plan_on} "
             f"(model={model_name}, latent_steps={latent_steps}, "
             f"comm_turns={latent_comm_turns or 'inherit text turns'}); "
-            "tool calls/planner/plan_task and graph pipeline unchanged."
+            "tool calls/planner and graph pipeline unchanged."
         )
         model = ModelWrapper(model_name, device, latent_space_realign=realign)
         for agent in self.graph.get_all_agents():
@@ -1506,10 +1508,14 @@ class Engine:
                 agent.latent_comm_model = model
                 agent.latent_comm_steps = latent_steps
                 agent.latent_comm_turns = latent_comm_turns
-            if latent_memory_on:
+            # The memory KV is shared by act() and plan_task compression; attach it
+            # if EITHER switch is on, then gate each independently.
+            if latent_memory_on or latent_memory_plan_on:
                 agent.latent_memory_model = model
                 agent.latent_memory_steps = latent_steps
                 agent.latent_memory_max_tokens = latent_memory_max_tokens
+                agent.latent_memory_act = latent_memory_on
+                agent.latent_memory_plan = latent_memory_plan_on
         # Reuse the text-graph pipeline verbatim; only the gated seams differ.
         self.graph_coordinate()
 
@@ -1714,7 +1720,8 @@ class Engine:
             "act_agents": sum(getattr(a, "act_agents_tokens", 0) for a in agents),
             "act_memory_ctx": sum(getattr(a, "act_memory_ctx_tokens", 0) for a in agents),
             "act_tool_schema": sum(getattr(a, "act_tool_schema_tokens", 0) for a in agents),
-            # plan_task split (also inside agent_reasoning; uses FULL memory).
+            # plan_task split (also inside agent_reasoning; FULL memory, or the same
+            # compressed context as act() when latent_memory_plan is on).
             "plan_task": sum(getattr(a, "plan_task_tokens", 0) for a in agents),
             "plan_task_memory": sum(getattr(a, "plan_task_memory_tokens", 0) for a in agents),
             "plan_task_history": sum(getattr(a, "plan_task_history_tokens", 0) for a in agents),
