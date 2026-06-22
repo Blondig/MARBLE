@@ -17,6 +17,9 @@
 export OPENAI_API_BASE="${OPENAI_API_BASE:-http://localhost:9999/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
+# Keep the baseline text-only even if the parent shell contains latent settings.
+unset GRAPH_LATENT LATENT_OUTPUT
+
 CONFIG_DIR="marble/configs/test_config_database"
 PREFIX="${PREFIX:-gpt-3.5-turbo}"
 N="${1:-100}"

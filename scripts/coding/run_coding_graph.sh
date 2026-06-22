@@ -23,6 +23,9 @@
 export OPENAI_API_BASE="${OPENAI_API_BASE:-http://localhost:9999/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 
+# Keep the baseline text-only even if the parent shell contains latent settings.
+unset GRAPH_LATENT LATENT_OUTPUT
+
 WORKSPACE_DIR="workspace"                          # matches workspace_dir in the configs
 CONFIG_DIR="marble/configs/coding_configs"
 SOLU_DIR="marble/logs/qwen3-8b/coding_solutions"
