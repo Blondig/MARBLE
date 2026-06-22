@@ -29,7 +29,7 @@ if [ "${LATENT_MEMORY_PLAN:-0}" = "1" ]; then
 fi
 [ "${LATENT_COMM:-1}" = "0" ] && _TAG="${_TAG}_nocomm"
 
-CONFIG_DIR="${RESEARCH_CONFIG_DIR:-multiagentbench/research_yaml_files_named}"
+CONFIG_DIR="${RESEARCH_CONFIG_DIR:-multiagentbench/research_yaml_files}"
 N="${1:-100}"
 export MARBLE_OUTPUT="result/research_graph_latent_steps${LATENT_STEPS}${_TAG}.jsonl"
 
