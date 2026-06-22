@@ -56,7 +56,7 @@ agents:
     data security, or fostering community engagement in scientific endeavors.'
   type: BaseAgent
 - agent_id: agent3
-  profile: 'My name is Zhaosu Gu. I am a researcher dedicated to the intersection
+  profile: 'My name is Neel Misciaci. I am a researcher dedicated to the intersection
     of graph neural networks and optimization techniques, particularly in the context
     of molecular adsorption. My recent work introduces AUGUR (Aware of Uncertainty
     Graph Unit Regression), a novel optimization pipeline that leverages the strengths

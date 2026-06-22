@@ -14,7 +14,7 @@ agents:
     impactful in various applications.
   type: BaseAgent
 - agent_id: agent2
-  profile: 'My name is Xuan Shen. As a researcher deeply immersed in the field of
+  profile: 'My name is Eren Doğan. As a researcher deeply immersed in the field of
     graph neural networks (GNNs) and their applications, my work focuses on enhancing
     the capabilities and understanding of these powerful models. My recent publications
     reflect a commitment to addressing the limitations of existing GNN architectures.

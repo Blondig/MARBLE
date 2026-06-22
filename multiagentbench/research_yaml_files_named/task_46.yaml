@@ -2,16 +2,16 @@ scenario: research
 task_id: 46
 agents:
 - agent_id: agent1
-  profile: "My name is Bishwash Paneru. I am a researcher dedicated to leveraging\
-    \ advanced technologies to address real-world challenges, particularly in the\
-    \ fields of water quality monitoring, assistive technologies for children with\
-    \ autism spectrum disorder (ASD), brain-computer interfaces (BCIs), battery management\
-    \ systems, and user experience design in e-learning environments. My recent work\
-    \ includes developing a hybrid deep learning model that significantly improves\
-    \ the prediction of seasonal water quality in Nepal, achieving remarkable accuracy\
-    \ with limited data. \n\nI have also explored the integration of augmented reality\
-    \ and large language models in therapeutic settings for children with ASD, emphasizing\
-    \ the importance of user interface design in enhancing engagement and effectiveness.\
+  profile: "My name is Biplov Paneru. I am a researcher dedicated to leveraging advanced\
+    \ technologies to address real-world challenges, particularly in the fields of\
+    \ water quality monitoring, assistive technologies for children with autism spectrum\
+    \ disorder (ASD), brain-computer interfaces (BCIs), battery management systems,\
+    \ and user experience design in e-learning environments. My recent work includes\
+    \ developing a hybrid deep learning model that significantly improves the prediction\
+    \ of seasonal water quality in Nepal, achieving remarkable accuracy with limited\
+    \ data. \n\nI have also explored the integration of augmented reality and large\
+    \ language models in therapeutic settings for children with ASD, emphasizing the\
+    \ importance of user interface design in enhancing engagement and effectiveness.\
     \ My research on EEG-based BCIs aims to empower individuals with motor impairments\
     \ by simulating keystrokes through neural activity, showcasing the potential of\
     \ deep learning in assistive technologies.\n\nIn the realm of battery management,\

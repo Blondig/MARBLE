@@ -415,7 +415,7 @@ agents:
     clinical outcomes while maintaining the highest standards of security and trust.'
   type: BaseAgent
 - agent_id: agent16
-  profile: 'My name is Hendrike Durani. As a researcher in the field of artificial
+  profile: 'My name is Benjamin Durani. As a researcher in the field of artificial
     intelligence and its applications in dermatology, I am deeply committed to enhancing
     diagnostic accuracy for melanoma through innovative AI systems. My recent work
     focuses on the integration of explainable AI (XAI) to bolster clinicians'' confidence

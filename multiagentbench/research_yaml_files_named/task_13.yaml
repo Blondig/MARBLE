@@ -53,8 +53,8 @@ agents:
     area.'
   type: BaseAgent
 - agent_id: agent3
-  profile: 'My name is Andy Wills. As a researcher deeply immersed in the field of
-    graph neural networks (GNNs) and their applications, my work primarily revolves
+  profile: 'My name is Ming-Chang Chiu. As a researcher deeply immersed in the field
+    of graph neural networks (GNNs) and their applications, my work primarily revolves
     around enhancing the capabilities and understanding of these powerful models.
     My recent publications reflect a commitment to addressing the limitations of existing
     GNN architectures. For instance, I developed Position-aware GNNs (P-GNNs) to better
