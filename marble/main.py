@@ -95,6 +95,13 @@ def main() -> None:
                 "LATENT_OUTPUT", "result/coding_graph_latent_output.jsonl"
             )
 
+    # Generic output override (applies to BOTH text and latent runs, so any domain
+    # -- incl. db whose configs write per-scenario files -- can aggregate one run
+    # into a single JSONL). Takes precedence over the config's / LATENT_OUTPUT path.
+    out_override = os.environ.get("MARBLE_OUTPUT")
+    if out_override and isinstance(config.output, dict):
+        config.output["file_path"] = out_override
+
     # Initialize and start the engine
     try:
         logging.info(f"Starting engine with configuration: {args.config_path}")
