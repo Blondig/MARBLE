@@ -1,3 +1,7 @@
+from functools import partial
+from unittest.mock import patch
+
+import httpx
 from beartype import beartype
 from beartype.typing import Any, Dict, List, Optional, Set, Tuple, Union
 from semanticscholar import SemanticScholar
@@ -6,6 +10,14 @@ from marble.llms.error_handler import api_calling_error_exponential_backoff
 from marble.llms.model_prompting import model_prompting
 
 from .prompt_constructor import openai_format_prompt_construct
+
+
+def _semantic_scholar_ssl_disabled():
+    insecure_client = partial(httpx.AsyncClient, verify=False)
+    return patch(
+        "semanticscholar.ApiRequester.httpx.AsyncClient",
+        insecure_client,
+    )
 
 
 def coauthor_frequency(
@@ -29,12 +41,13 @@ def coauthor_filter(co_authors: Dict[str, int], limit: int = 5) -> List[str]:
 def match_author_ids(
     author_name: str, known_paper_titles: Optional[List[str]] = None
 ) -> Set[str]:
-    semantic_client = SemanticScholar()
-    search_results = semantic_client.search_author(
-        author_name,
-        fields=["authorId", "papers.title"],
-        limit=100,
-    )
+    with _semantic_scholar_ssl_disabled():
+        semantic_client = SemanticScholar()
+        search_results = semantic_client.search_author(
+            author_name,
+            fields=["authorId", "papers.title"],
+            limit=100,
+        )
 
     author_ids = set()
     if known_paper_titles is None:
@@ -63,15 +76,16 @@ def match_author_ids(
 def get_papers_from_author_id(
     author_id: str, paper_max_num: int = 20
 ) -> List[Dict[str, Any]]:
-    semantic_client = SemanticScholar()
-    author_data: Dict[str, Any] = semantic_client.get_author(
-        author_id,
-        fields=[
-            "papers.title",
-            "papers.abstract",
-            "papers.authors",
-        ],
-    )
+    with _semantic_scholar_ssl_disabled():
+        semantic_client = SemanticScholar()
+        author_data: Dict[str, Any] = semantic_client.get_author(
+            author_id,
+            fields=[
+                "papers.title",
+                "papers.abstract",
+                "papers.authors",
+            ],
+        )
     papers = author_data["papers"]
     return papers[:paper_max_num] if isinstance(papers, list) else []
 
