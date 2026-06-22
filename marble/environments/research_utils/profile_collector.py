@@ -65,7 +65,7 @@ def match_author_ids(
                     break
 
     if not author_ids:
-        raise ValueError("No authors found with matching paper titles or name.")
+        return set()
     elif len(author_ids) > 1 and known_paper_titles:
         raise ValueError("Multiple authors found with matching paper titles.")
 
@@ -98,6 +98,8 @@ def collect_publications_and_coauthors(
 ) -> Tuple[List[str], List[str], List[str]]:
     try:
         matched_author_ids = match_author_ids(author, known_paper_titles)
+        if not matched_author_ids:
+            return [], [], []
         author_id = matched_author_ids.pop()  # Only one author ID is expected
 
         papers = get_papers_from_author_id(author_id, paper_max_num)
