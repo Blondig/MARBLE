@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 860" font-family="Helvetica,Arial,sans-serif">
+  <defs>
+    <style>
+      .orig{fill:#F1F3F4;stroke:#9CA3AF;stroke-width:1.5}
+      .innov{fill:#DBEAFE;stroke:#1E3A8A;stroke-width:2}
+      .data{fill:#FFFFFF;stroke:#111;stroke-width:1.5}
+      .cont{fill:#FFFFFF;stroke:#666;stroke-width:1.5;stroke-dasharray:7 5}
+      .leg{fill:#FFFFFF;stroke:#111;stroke-width:1}
+      text{font-size:13px;fill:#111;text-anchor:middle}
+      .tb{font-weight:bold}
+      .tt{font-size:16px;font-weight:bold}
+      .tr{fill:#D11020}
+      .lft{text-anchor:start}
+      .eb{stroke:#111;stroke-width:1.8;fill:none;marker-end:url(#ab)}
+      .er{stroke:#D11020;stroke-width:1.8;fill:none;marker-end:url(#ar)}
+      .err{stroke:#D11020;stroke-width:1.8;fill:none;marker-end:url(#ar);marker-start:url(#ar)}
+    </style>
+    <marker id="ab" markerWidth="10" markerHeight="8" refX="8" refY="3" orient="auto-start-reverse"><path d="M0,0 L9,3 L0,6 Z" fill="#111"/></marker>
+    <marker id="ar" markerWidth="10" markerHeight="8" refX="8" refY="3" orient="auto-start-reverse"><path d="M0,0 L9,3 L0,6 Z" fill="#D11020"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1080" height="860" fill="#FFFFFF"/>
+
+  <!-- title + axis -->
+  <text x="20" y="28" class="tt lft">Latent-MARBLE 架构：多 Agent 跨轮协作 × Latent 压缩</text>
+  <text x="20" y="48" class="lft">横 → 多 Agent（通信沿横向）   纵 ↓ 跨轮隐状态演化（K^t → K^{t+1}）</text>
+
+  <!-- top chain -->
+  <rect class="orig" x="250" y="64" width="300" height="40" rx="6"/>
+  <text x="400" y="89" class="tb">全局任务 Task ＋ Agent 协作图（全连）</text>
+  <path class="eb" d="M400,104 L400,126"/>
+  <rect class="orig" x="235" y="126" width="330" height="40" rx="6"/>
+  <text x="400" y="151" class="tb">MARBLE 图协调器 / EnginePlanner（全局调度）</text>
+  <path class="eb" d="M400,166 L400,192"/>
+  <text x="408" y="184" class="tr lft">分发同一全局 task</text>
+  <rect class="cont" x="240" y="192" width="320" height="32" rx="6"/>
+  <text x="400" y="212">round 0：每 agent ← 同一 task，仅 act()</text>
+  <path class="eb" d="M400,224 L400,252"/>
+  <text x="408" y="244" class="lft">继续</text>
+
+  <!-- round-t container -->
+  <rect class="cont" x="30" y="252" width="760" height="378" rx="10"/>
+  <text x="48" y="274" class="tb lft">第 t 轮 (t ≥ 1)</text>
+  <text x="720" y="274">C … N 同构</text>
+
+  <!-- Agent A -->
+  <rect class="data" x="95" y="292" width="210" height="40" rx="6"/>
+  <text x="200" y="317" class="tb">私有 KV  K_A^t</text>
+  <path class="er" d="M200,332 L200,362"/>
+  <text x="212" y="351" class="tr lft">③ 解码 ≤256</text>
+  <rect class="data" x="95" y="362" width="210" height="36" rx="6"/>
+  <text x="200" y="385">短上下文 m_A^t</text>
+  <path class="eb" d="M200,398 L200,428"/>
+  <text x="212" y="417" class="lft">plan_task</text>
+  <rect class="orig" x="85" y="428" width="230" height="48" rx="6"/>
+  <text x="200" y="450" class="tb">act()</text>
+  <text x="200" y="467">④ 原生 tool_calls（按需 env/通信）</text>
+
+  <!-- Agent B -->
+  <rect class="data" x="455" y="292" width="210" height="40" rx="6"/>
+  <text x="560" y="317" class="tb">私有 KV  K_B^t</text>
+  <path class="er" d="M560,332 L560,362"/>
+  <text x="572" y="351" class="tr lft">③ 解码 ≤256</text>
+  <rect class="data" x="455" y="362" width="210" height="36" rx="6"/>
+  <text x="560" y="385">短上下文 m_B^t</text>
+  <path class="eb" d="M560,398 L560,428"/>
+  <text x="572" y="417" class="lft">plan_task</text>
+  <rect class="orig" x="445" y="428" width="230" height="48" rx="6"/>
+  <text x="560" y="450" class="tb">act()</text>
+  <text x="560" y="467">④ 原生 tool_calls（按需 env/通信）</text>
+
+  <!-- side communication (innovation) -->
+  <rect class="innov" x="328" y="430" width="144" height="46" rx="6"/>
+  <text x="400" y="450" class="tb">① Latent 侧通信</text>
+  <text x="400" y="467">（按需·早停）</text>
+  <text x="400" y="423" class="tr">h¹→h²→… 早停</text>
+  <path class="err" d="M315,452 L327,452"/>
+  <path class="err" d="M473,452 L485,452"/>
+
+  <!-- converge to engine planner -->
+  <rect class="orig" x="300" y="536" width="200" height="52" rx="6"/>
+  <text x="400" y="558" class="tb">EnginePlanner</text>
+  <text x="400" y="576">summarize→summary→decide</text>
+  <path class="eb" d="M200,476 L360,536"/>
+  <text x="250" y="510" class="lft">result_A</text>
+  <path class="eb" d="M560,476 L440,536"/>
+  <text x="500" y="510" class="lft">result_B</text>
+
+  <!-- delta out of round (red, innovation memory path) -->
+  <path class="er" d="M150,476 L150,648"/>
+  <text x="120" y="540" class="tr lft">Δ_A</text>
+  <path class="er" d="M610,476 L610,648"/>
+  <text x="618" y="540" class="tr lft">Δ_B</text>
+
+  <!-- delta boxes (below container) -->
+  <rect class="data" x="60" y="648" width="245" height="38" rx="6"/>
+  <text x="182" y="671">Δ_A^t = 动作 + 工具结果 (+通信)</text>
+  <rect class="data" x="455" y="648" width="245" height="38" rx="6"/>
+  <text x="577" y="671">Δ_B^t = 动作 + 工具结果</text>
+
+  <!-- delta-KV update (innovation) -->
+  <rect class="innov" x="80" y="706" width="205" height="34" rx="6"/>
+  <text x="182" y="728" class="tb">② Delta-KV 更新</text>
+  <path class="er" d="M182,686 L182,706"/>
+  <rect class="innov" x="475" y="706" width="205" height="34" rx="6"/>
+  <text x="577" y="728" class="tb">② Delta-KV 更新</text>
+  <path class="er" d="M577,686 L577,706"/>
+
+  <!-- K^{t+1} -->
+  <rect class="data" x="80" y="762" width="205" height="44" rx="6"/>
+  <text x="182" y="780" class="tb">K_A^{t+1}</text>
+  <text x="182" y="797">= Update(K_A^t, Δ_A^t)</text>
+  <path class="er" d="M182,740 L182,762"/>
+  <rect class="data" x="475" y="762" width="205" height="44" rx="6"/>
+  <text x="577" y="780" class="tb">K_B^{t+1}</text>
+  <text x="577" y="797">= Update(K_B^t, Δ_B^t)</text>
+  <path class="er" d="M577,740 L577,762"/>
+
+  <!-- loop back to next round (black solid) -->
+  <path class="eb" d="M80,784 L42,784 L42,312 L95,312"/>
+  <text x="34" y="540" class="lft">进入</text>
+  <text x="34" y="556" class="lft">t+1</text>
+  <path class="eb" d="M680,784 L735,784 L735,312 L665,312"/>
+  <text x="742" y="548" class="lft">进入 t+1</text>
+
+  <!-- terminate -> final -> eval -->
+  <path class="eb" d="M470,588 L612,690"/>
+  <text x="520" y="630" class="lft">终止</text>
+  <rect class="orig" x="540" y="690" width="248" height="42" rx="6"/>
+  <text x="664" y="716" class="tb">最后一轮 summary = 最终结果</text>
+  <path class="eb" d="M664,732 L664,760"/>
+  <rect class="orig" x="525" y="760" width="280" height="50" rx="6"/>
+  <text x="665" y="781">evaluate_task_*</text>
+  <text x="665" y="798">coding: code_quality / research: innov·safety·feasibility</text>
+
+  <!-- legend -->
+  <rect class="leg" x="822" y="70" width="240" height="214" rx="6"/>
+  <text x="942" y="92" class="tb">图例</text>
+  <rect class="innov" x="834" y="104" width="24" height="15"/>
+  <text x="866" y="116" class="lft">本工作创新（Latent）</text>
+  <rect class="orig" x="834" y="130" width="24" height="15"/>
+  <text x="866" y="142" class="lft">原版组件（不变）</text>
+  <rect class="data" x="834" y="156" width="24" height="15"/>
+  <text x="866" y="168" class="lft">空白·实线 = 状态/数据 K·m·Δ</text>
+  <rect class="cont" x="834" y="182" width="24" height="15"/>
+  <text x="866" y="194" class="lft">空白·虚线 = 容器/边界/按需</text>
+  <path class="er" d="M834,216 L858,216"/>
+  <text x="866" y="220" class="tr lft">红 = 创新链路（latent）</text>
+  <path class="eb" d="M834,240 L858,240"/>
+  <text x="866" y="244" class="lft">黑 = 原版主流程</text>
+  <text x="834" y="270" class="tb lft">黑加粗 = 关键节点</text>
+</svg>

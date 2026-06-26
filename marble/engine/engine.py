@@ -1711,9 +1711,10 @@ class Engine:
             "agent_reasoning": agents_total - communication - memory_latent,
             "planner": self.planner.token_usage,
             "env_tools": getattr(self.environment, "token_usage", 0),
-            # Diagnostic split of the act() prompt (subdivides agent_reasoning; the
-            # first five are inside it, act_tool_schema is the tools= schema that is
-            # NOT counted in agent_reasoning -- the previously-invisible cost).
+            # Diagnostic split of the act() prompt (subdivides agent_reasoning). Since
+            # step 0 (accounting unification) the tools= schema IS charged to
+            # token_usage, so act_tool_schema is now a real sub-component of
+            # agent_reasoning (was previously an uncounted "shadow" cost).
             "act_profile": sum(getattr(a, "act_profile_tokens", 0) for a in agents),
             "act_fixed": sum(getattr(a, "act_fixed_tokens", 0) for a in agents),
             "act_task": sum(getattr(a, "act_task_tokens", 0) for a in agents),

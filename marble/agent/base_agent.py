@@ -384,7 +384,14 @@ class BaseAgent:
         self.act_task_tokens += tsk
         self.act_agents_tokens += agts
         self.act_memory_ctx_tokens += memc
-        self.act_tool_schema_tokens += _ct(json.dumps(tools, default=str))
+        _tsch = _ct(json.dumps(tools, default=str))
+        self.act_tool_schema_tokens += _tsch
+        # step 0 (accounting unification): the tools= schema is prefilled by vLLM on
+        # every act() call, but litellm's token_counter(messages) does NOT bill it --
+        # it was a "shadow" cost (shown only as a diagnostic %). Count it in token_usage
+        # so it lands in total/agent_reasoning, and so tool-schema routing / agent-desc
+        # compression savings become visible in the headline metric.
+        self.token_usage += _tsch
         self.act_fixed_tokens += max(0, _ct(act_task) - prof - tsk - agts - memc)
         return act_task, tools
 
