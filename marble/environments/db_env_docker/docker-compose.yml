@@ -15,7 +15,9 @@ services:
     ports:
       - 5432:5432
     volumes:
-      - /var/lib/postgresql/data
+      # postgres:18+ images require the mount at /var/lib/postgresql (not .../data),
+      # see https://github.com/docker-library/postgres/pull/1259
+      - /var/lib/postgresql
     command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all -c max_connections=200 -c log_min_error_statement=info -c logging_collector=on
     environment:
       POSTGRES_USER: test
