@@ -41,6 +41,10 @@ def main() -> None:
     )
     ap.add_argument("files", nargs="+", help="aggregated result JSONL file(s)")
     ap.add_argument("--model", default="openai/Qwen3-8B", help="judge LLM (vLLM)")
+    ap.add_argument(
+        "--verbose", action="store_true",
+        help="print gold labels and judge-extracted labels per row (debug only)",
+    )
     args = ap.parse_args()
 
     error_count = 0
@@ -129,6 +133,10 @@ def main() -> None:
 
             # Compare predictions with the gold label
             match_count = sum(g in predicted_labels for g in gold_labels)
+            if args.verbose:
+                print(f"Predicted labels: {predicted_labels}")
+                print(f"Gold labels: {gold_labels}")
+                print(f"Match count: {match_count}\n")
             task_scores.append(match_count / len(gold_labels) if gold_labels else 0)
 
             # Add a delay to avoid API rate limits
