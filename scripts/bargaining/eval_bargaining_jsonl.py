@@ -4,13 +4,14 @@
 This automates the original MARBLE procedure documented in
 ``scripts/world/readme.md``: evaluate the same final-round summary twice, once
 with the original buyer prompt and once with the original seller prompt.  The
-scoring protocol is intentionally unchanged:
+role prompts and scoring semantics are unchanged:
 
 * input = ``row["task"]`` and ``row["iterations"][-1]["summary"]``;
 * one user message per role;
 * ``max_tokens=512`` by default, ``temperature=0.0``, ``top_p=None``;
-* the original ``Evaluator.parse_task_world_evaluation`` parser, including its
-  greedy JSON regex and ``-1`` sentinel on malformed output;
+* the final complete JSON object for the requested role is isolated before the
+  original ``Evaluator.parse_task_world_evaluation`` field conversion;
+* the original ``-1`` sentinel remains in use for malformed ratings;
 * no JSON repair, format retry, prompt rewrite, or score clamping.
 
 The scored output copies every source row and replaces only
@@ -104,6 +105,40 @@ def qwen_extra_body(model: str) -> Dict[str, Any] | None:
     return None
 
 
+def extract_last_role_rating_json(response: str, role: str) -> str | None:
+    """Return the last complete top-level rating object for ``role``.
+
+    Bargaining judge explanations may quote earlier tool-call arguments such as
+    ``{"price": 1200}``.  The legacy evaluator's greedy ``{...}`` regex then
+    joins that object to the final rating object and rejects the combined text
+    as invalid JSON.  Decode from each opening brace in reverse order so nested
+    objects, earlier tool arguments, and trailing prose are skipped safely.
+    """
+    decoder = json.JSONDecoder()
+    search_end = len(response)
+
+    while search_end > 0:
+        start = response.rfind("{", 0, search_end)
+        if start < 0:
+            return None
+
+        try:
+            candidate, _ = decoder.raw_decode(response[start:])
+        except json.JSONDecodeError:
+            search_end = start
+            continue
+
+        role_ratings = candidate.get(role) if isinstance(candidate, dict) else None
+        if isinstance(role_ratings, dict) and any(
+            criterion in role_ratings for criterion in CRITERIA
+        ):
+            return json.dumps(candidate, ensure_ascii=False)
+
+        search_end = start
+
+    return None
+
+
 def call_local_judge(
     *, model: str, base_url: str, api_key: str, prompt: str, max_tokens: int
 ) -> str:
@@ -150,7 +185,10 @@ def evaluate_role(
         prompt=prompt,
         max_tokens=max_tokens,
     )
-    parsed = evaluator.parse_task_world_evaluation(raw_response)
+    rating_json = extract_last_role_rating_json(raw_response, role)
+    parsed = evaluator.parse_task_world_evaluation(
+        rating_json if rating_json is not None else raw_response
+    )
     # Each original role prompt returns only its own top-level key.  Keep only
     # that role so the default -1 values for the opposite role cannot overwrite
     # the result from the other independent call.
