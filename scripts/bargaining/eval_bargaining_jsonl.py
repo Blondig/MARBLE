@@ -8,7 +8,7 @@ scoring protocol is intentionally unchanged:
 
 * input = ``row["task"]`` and ``row["iterations"][-1]["summary"]``;
 * one user message per role;
-* ``max_tokens=512``, ``temperature=0.0``, ``top_p=None``;
+* ``max_tokens=512`` by default, ``temperature=0.0``, ``top_p=None``;
 * the original ``Evaluator.parse_task_world_evaluation`` parser, including its
   greedy JSON regex and ``-1`` sentinel on malformed output;
 * no JSON repair, format retry, prompt rewrite, or score clamping.
@@ -23,7 +23,8 @@ Examples (an OpenAI-compatible local server must already be running)::
       result/bargaining_graph_solutions.jsonl \
       --out result/bargaining_graph_offline_eval.jsonl \
       --model openai/Qwen3-8B \
-      --base-url http://localhost:9999/v1
+      --base-url http://localhost:9999/v1 \
+      --max-tokens 2048
 
     python -m scripts.bargaining.eval_bargaining_jsonl \
       result/bargaining_graph_latent_steps10_memory512_plan.jsonl \
@@ -104,13 +105,13 @@ def qwen_extra_body(model: str) -> Dict[str, Any] | None:
 
 
 def call_local_judge(
-    *, model: str, base_url: str, api_key: str, prompt: str
+    *, model: str, base_url: str, api_key: str, prompt: str, max_tokens: int
 ) -> str:
     """Make one original-parameter LLM-as-a-judge call."""
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 512,
+        "max_tokens": max_tokens,
         "n": 1,
         "temperature": 0.0,
         "top_p": None,
@@ -135,6 +136,7 @@ def evaluate_role(
     model: str,
     base_url: str,
     api_key: str,
+    max_tokens: int,
 ) -> Tuple[Dict[str, int], str]:
     """Run one unchanged original role prompt and return that role's parsed scores."""
     prompt_template = evaluator.evaluation_prompts["world"]["task_evaluation"][
@@ -142,7 +144,11 @@ def evaluate_role(
     ]
     prompt = prompt_template.format(task=task, result=result)
     raw_response = call_local_judge(
-        model=model, base_url=base_url, api_key=api_key, prompt=prompt
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        prompt=prompt,
+        max_tokens=max_tokens,
     )
     parsed = evaluator.parse_task_world_evaluation(raw_response)
     # Each original role prompt returns only its own top-level key.  Keep only
@@ -238,6 +244,12 @@ def parse_args() -> argparse.Namespace:
         help="local API key (default: OPENAI_API_KEY or EMPTY)",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="maximum judge output tokens (original MARBLE default: 512)",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -263,6 +275,8 @@ def main() -> None:
         raise ValueError("--raw-out must differ from both input and --out")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be at least 1")
+    if args.max_tokens < 1:
+        raise ValueError("--max-tokens must be at least 1")
 
     source_rows = load_jsonl(input_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,6 +318,7 @@ def main() -> None:
                     model=args.model,
                     base_url=args.base_url,
                     api_key=args.api_key,
+                    max_tokens=args.max_tokens,
                 )
                 ratings[role] = role_scores
                 raw_responses[role] = raw_response
@@ -320,7 +335,7 @@ def main() -> None:
                 "model": args.model,
                 "base_url": args.base_url,
                 "judge_parameters": {
-                    "max_tokens": 512,
+                    "max_tokens": args.max_tokens,
                     "temperature": 0.0,
                     "top_p": None,
                 },
